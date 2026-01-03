@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+    "strings"
 	"fmt"
 	"net/http"
+    "net/url"
 	"time"
 
 	"dbh-go-srv/internal/dab"
@@ -40,11 +42,23 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Decode Request
-	var req ConversionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendError("Invalid request JSON")
-		return
-	}
+    var req ConversionRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        sendError("Invalid request JSON")
+        return
+    }
+
+    // Security: Validate the URL format
+    parsedURL, err := url.ParseRequestURI(req.URL)
+    if err != nil || !strings.Contains(parsedURL.Host, "youtube.com") && !strings.Contains(parsedURL.Host, "youtu.be") {
+        if req.Type == "youtube" {
+        sendError("Invalid YouTube URL")
+        return
+        }
+    }
+
+    // Only use the validated string version
+    cleanURL := parsedURL.String()
 
 	// 2. Auth check
 	token := r.Header.Get("X-DAB-Token")
@@ -58,13 +72,12 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
 	var tracks []models.Track
 	var sourceName string
-	var err error
 
 	switch req.Type {
 	case "spotify":
 		tracks, sourceName, err = parser.ParseSpotify(req.URL)
 	case "youtube":
-		tracks, sourceName, err = parser.ParseYouTube(req.URL)
+		tracks, sourceName, err = parser.ParseYouTube(cleanURL)
 	default:
 		sendError("Unsupported source type")
 		return

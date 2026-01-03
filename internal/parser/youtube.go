@@ -1,51 +1,50 @@
 package parser
 
 import (
-	"encoding/json"
-	"os/exec"
-    "strings"
-    
+	"fmt"
+
 	"dbh-go-srv/internal/models"
+	"github.com/kkdai/youtube/v2"
 )
 
-type YtDlpEntry struct {
-	Title    string `json:"title"`
-	Uploader string `json:"uploader"`
-	ID       string `json:"id"`
-	ISRC     string `json:"isrc"`
-}
-
 func ParseYouTube(url string) ([]models.Track, string, error) {
-	// Execute yt-dlp to get flat playlist info
-	cmd := exec.Command("yt-dlp", "--dump-json", "--flat-playlist", "--no-warnings", url)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, "", err
+	client := youtube.Client{}
+
+	// 1. Try to parse as a playlist first
+	playlist, err := client.GetPlaylist(url)
+	if err == nil {
+		var tracks []models.Track
+		
+		// The library returns a playlist object with a list of videos
+		for _, entry := range playlist.Videos {
+			// entry.Author is the Uploader
+			artist, title := NormalizeYTTitle(entry.Title, entry.Author)
+			
+			tracks = append(tracks, models.Track{
+				Title:    title,
+				Artist:   artist,
+				SourceID: entry.ID,
+				// Note: Native Go libs rarely extract ISRC as easily as yt-dlp
+				// because it requires deep metadata parsing.
+			})
+		}
+		return tracks, playlist.Title, nil
 	}
 
-	// yt-dlp outputs one JSON object per line for playlists
-	lines := strings.Split(string(output), "\n")
-	var tracks []models.Track
-	var playlistTitle string
+	// 2. Fallback: Parse as a single video if playlist parsing fails
+	video, err := client.GetVideo(url)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse YouTube URL: %w", err)
+	}
 
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var entry YtDlpEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-
-		artist, title := NormalizeYTTitle(entry.Title, entry.Uploader)
-		
-		tracks = append(tracks, models.Track{
+	artist, title := NormalizeYTTitle(video.Title, video.Author)
+	tracks := []models.Track{
+		{
 			Title:    title,
 			Artist:   artist,
-			ISRC:     entry.ISRC,
-			SourceID: entry.ID,
-		})
+			SourceID: video.ID,
+		},
 	}
 
-	return tracks, playlistTitle, nil
+	return tracks, video.Title, nil
 }

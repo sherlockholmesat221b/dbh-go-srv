@@ -23,21 +23,36 @@ func NormalizeYTTitle(rawTitle string, uploader string) (string, string) {
 	t = spaceRegex.ReplaceAllString(t, " ")
 	t = strings.TrimSpace(t)
 
-	// 2. Try to split "Artist - Title"
+	// 2. Strong heuristic: literal "Artist - Title"
+	// (this is your original function's logic, kept intentionally)
+	if strings.Contains(t, " - ") {
+		parts := strings.SplitN(t, " - ", 2)
+		left := strings.TrimSpace(parts[0])
+		right := strings.TrimSpace(parts[1])
+
+		if left != "" && right != "" {
+			return capWords(left), capWords(right)
+		}
+	}
+
+	// 3. Flexible split using regex + heuristics
 	parts := splitRegex.Split(t, 2)
 	if len(parts) == 2 {
-		left, right := parts[0], parts[1]
+		left := strings.TrimSpace(parts[0])
+		right := strings.TrimSpace(parts[1])
+
 		if looksLikeArtist(left, right) {
 			return capWords(left), capWords(right)
 		}
 		return capWords(right), capWords(left)
 	}
 
-	// 3. Fallback: No clear split, use uploader as artist
+	// 4. Fallback: uploader as artist
 	if uploader != "" {
 		return capWords(uploader), capWords(t)
 	}
 
+	// 5. Last resort
 	return "", capWords(t)
 }
 
