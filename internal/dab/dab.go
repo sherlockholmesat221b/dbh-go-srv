@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+    "fmt"
 
 	"golang.org/x/time/rate"
 )
@@ -39,9 +40,22 @@ func GetClient(token string) *Client {
 
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	c.Limiter.Wait(context.Background())
+
+	// 1. Set the exact UA again
 	req.Header.Set("User-Agent", UserAgent)
+
+	// 2. Auth: Some APIs are picky about "Bearer " vs "bearer " or just the token.
+    // Based on your curl, "Bearer " is correct.
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-	req.AddCookie(&http.Cookie{Name: "session", Value: c.Token})
+    
+    // 3. IMPORTANT: Explicitly set the Cookie header string 
+    // Sometimes req.AddCookie acts differently than a manual header set in Go
+    req.Header.Set("Cookie", fmt.Sprintf("session=%s", c.Token))
+
+	// 4. Mimic Browser more closely
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Referer", "https://dabmusic.xyz/")
+	req.Header.Set("Origin", "https://dabmusic.xyz")
+
 	return c.HTTPClient.Do(req)
 }
-

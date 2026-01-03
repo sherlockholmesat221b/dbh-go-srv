@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"dbh-go-srv/internal/models" // Import restored
+	"dbh-go-srv/internal/models"
 )
 
 func (c *Client) CreateLibrary(name string) (string, error) {
@@ -46,7 +46,6 @@ func (c *Client) CreateLibrary(name string) (string, error) {
 	return result.Library.ID, nil
 }
 
-// RESTORED: This method was missing in your last edit
 func (c *Client) AddTrackToLibrary(libraryID string, match models.MatchResult) error {
 	if match.DabTrackID == nil {
 		return fmt.Errorf("cannot add track: DabTrackID is nil")

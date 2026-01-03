@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+    "io"
 )
 
 // DabTrack represents the DAB API response item
 type DabTrack struct {
-	ID           string `json:"id"`
+	ID           int    `json:"id"` // Changed from string to int
 	Title        string `json:"title"`
 	Artist       string `json:"artist"`
 	AudioQuality struct {
@@ -28,12 +29,18 @@ func (c *Client) Search(query string) []DabTrack {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
 	var result struct {
 		Tracks []DabTrack `json:"tracks"`
 	}
 	
-	// Handle both raw list and wrapped object
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
+		fmt.Printf("DECODE ERROR: %v\n", err)
 		return nil
 	}
 	return result.Tracks
