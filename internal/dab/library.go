@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"dbh-go-srv/internal/models"
 )
 
 func (c *Client) CreateLibrary(name string) (string, error) {
@@ -46,20 +45,24 @@ func (c *Client) CreateLibrary(name string) (string, error) {
 	return result.Library.ID, nil
 }
 
-func (c *Client) AddTrackToLibrary(libraryID string, match models.MatchResult) error {
-	if match.DabTrackID == nil {
-		return fmt.Errorf("cannot add track: DabTrackID is nil")
-	}
-
+func (c *Client) AddTrackToLibrary(libraryID string, track DabTrack) error {
+	// Replicating the EXACT AddTrackToLibraryRequest schema
 	payload := map[string]interface{}{
 		"track": map[string]interface{}{
-			"id":     *match.DabTrackID,
-			"title":  match.Title,
-			"artist": match.Artist,
+			"id":          fmt.Sprintf("%d", track.ID),
+			"title":       track.Title,
+			"artist":      track.Artist,
+			"artistId":    track.ArtistID,
+			"albumTitle":  track.AlbumTitle,
+			"albumCover":  track.AlbumCover,
+			"albumId":     fmt.Sprintf("%v", track.AlbumID), // Handles alphanumeric
+			"releaseDate": track.ReleaseDate,
+			"genre":       track.Genre,
+			"duration":    track.Duration,
 			"audioQuality": map[string]interface{}{
-				"maximumBitDepth":    24,
-				"maximumSamplingRate": 96,
-				"isHiRes":            true,
+				"maximumBitDepth":     track.AudioQuality.BitDepth,
+				"maximumSamplingRate": track.AudioQuality.SamplingRate,
+				"isHiRes":             track.AudioQuality.IsHiRes,
 			},
 		},
 	}
@@ -78,8 +81,7 @@ func (c *Client) AddTrackToLibrary(libraryID string, match models.MatchResult) e
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to add track (Status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("DAB Add Error (%d): %s", resp.StatusCode, string(respBody))
 	}
-	
 	return nil
 }

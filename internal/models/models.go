@@ -11,16 +11,17 @@ type Track struct {
 
 type MatchResult struct {
 	Track
-	MatchStatus string  `json:"match_status"` // FOUND | NOT_FOUND
-	DabTrackID  *string `json:"dab_track_id"`
+	MatchStatus string      `json:"match_status"`
+	DabTrackID  *string     `json:"dab_track_id"`
+	RawTrack    interface{} `json:"-"` // Use interface{} to avoid circular import
 }
 
 type Report struct {
-	Library     LibraryInfo   `json:"library"`
-	Source      SourceInfo    `json:"source"`
-	MatchingMode string       `json:"matching_mode"`
-	Timestamp   string        `json:"timestamp"`
-	Tracks      []MatchResult `json:"tracks"`
+	Library      LibraryInfo   `json:"library"`
+	Source       SourceInfo    `json:"source"`
+	MatchingMode string        `json:"matching_mode"`
+	Timestamp    string        `json:"timestamp"`
+	Tracks       []MatchResult `json:"tracks"`
 }
 
 type LibraryInfo struct {

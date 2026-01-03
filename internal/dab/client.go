@@ -10,14 +10,25 @@ import (
 
 // DabTrack represents the DAB API response item
 type DabTrack struct {
-	ID           int    `json:"id"` // Changed from string to int
-	Title        string `json:"title"`
-	Artist       string `json:"artist"`
+	ID           int     `json:"id"`
+	Title        string  `json:"title"`
+	Artist       string  `json:"artist"`
+	ArtistID     int     `json:"artistId"`
+	AlbumTitle   string  `json:"albumTitle"`
+	AlbumCover   string  `json:"albumCover"`
+	AlbumID      any     `json:"albumId"` // Handles both number or string (alphanumeric)
+	ReleaseDate  string  `json:"releaseDate"`
+	Genre        string  `json:"genre"`
+	Duration     int     `json:"duration"`
 	AudioQuality struct {
-		SamplingRate int `json:"maximumSampleRate"`
-		BitDepth     int `json:"maximumBitDepth"`
+		SamplingRate float64 `json:"maximumSampleRate"`
+		BitDepth     int     `json:"maximumBitDepth"`
+		IsHiRes      bool    `json:"isHiRes"`
 	} `json:"audioQuality"`
 }
+
+
+
 
 func (c *Client) Search(query string) []DabTrack {
 	searchURL := fmt.Sprintf("%s/search?q=%s&type=track", DABAPIBase, url.QueryEscape(query))

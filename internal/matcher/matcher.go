@@ -1,7 +1,7 @@
 package matcher
 
 import (
-	"fmt" // Added missing import
+	"fmt"
 	"strings"
 	"dbh-go-srv/internal/dab"
 	"dbh-go-srv/internal/models"
@@ -10,20 +10,22 @@ import (
 )
 
 func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchResult {
+	// 1. Try ISRC Match first
 	if t.ISRC != "" {
 		res := client.Search(t.ISRC)
 		if len(res) > 0 {
 			best := findBestQuality(res)
-			idStr := fmt.Sprintf("%d", best.ID) // Convert int to string
+			idStr := fmt.Sprintf("%d", best.ID)
 			return &models.MatchResult{
 				Track:       t, 
 				MatchStatus: "FOUND", 
 				DabTrackID:  &idStr,
+				RawTrack:    &best, // Crucial: ensure ISRC match also passes metadata
 			}
 		}
 	}
     
-	// Clean title: Remove anything in brackets/parentheses for better search
+	// 2. Prepare fuzzy search query
 	cleanTitle := t.Title
 	if idx := strings.IndexAny(cleanTitle, "(["); idx != -1 {
 		cleanTitle = strings.TrimSpace(cleanTitle[:idx])
@@ -32,21 +34,25 @@ func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchRe
 	query := strings.ToLower(t.Artist + " " + cleanTitle)
 	results := client.Search(query)
 
-	if mode == "strict" && len(results) == 0 {
-		return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
-	}
-
-	// If the clean search returned nothing, try one last time with the full title
+	// 3. Fallback to full title if clean title yields nothing
 	if len(results) == 0 && cleanTitle != t.Title {
 		query = strings.ToLower(t.Artist + " " + t.Title)
 		results = client.Search(query)
 	}
+
+	if len(results) == 0 {
+		return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
+	}
 	
-	var bestID string
+	// 4. Fuzzy Matching Loop
+	var bestTrack *dab.DabTrack
 	var highestScore float64
 
 	for _, cand := range results {
-		candStr := strings.ToLower(cand.Artist + " " + cand.Title)
+		// Create a local copy so we can take a safe pointer
+		currentCand := cand
+		candStr := strings.ToLower(currentCand.Artist + " " + currentCand.Title)
+		
 		score := strutil.Similarity(query, candStr, metrics.NewJaroWinkler())
 		
 		threshold := 0.85
@@ -56,24 +62,24 @@ func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchRe
 
 		if score > highestScore && score >= threshold {
 			highestScore = score
-			bestID = fmt.Sprintf("%d", cand.ID) // Convert int to string
+			bestTrack = &currentCand
 		}
 	}
 
-	if bestID != "" {
-		// We need a local copy to get a stable pointer
-		finalID := bestID 
+	// 5. Return result with Metadata for the 'Add' step
+	if bestTrack != nil {
+		idStr := fmt.Sprintf("%d", bestTrack.ID)
 		return &models.MatchResult{
-			Track:       t, 
-			MatchStatus: "FOUND", 
-			DabTrackID:  &finalID,
+			Track:       t,
+			MatchStatus: "FOUND",
+			DabTrackID:  &idStr,
+			RawTrack:    bestTrack, 
 		}
 	}
 
 	return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
 }
 
-// findBestQuality replicates Python logic for picking the best audio quality
 func findBestQuality(tracks []dab.DabTrack) dab.DabTrack {
 	best := tracks[0]
 	for _, t := range tracks {
