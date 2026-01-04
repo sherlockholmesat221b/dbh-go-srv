@@ -39,7 +39,8 @@ type ConversionRequest struct {
 	URL          string `json:"url"`
 	Type         string `json:"type"`
 	MatchingMode string `json:"matching_mode"`
-    ForceSync    bool   `json:"force_sync"`
+	ForceSync    bool   `json:"force_sync"`
+	LibID        string `json:"lib_id,omitempty"` // optional, append tracks if provided
 }
 
 func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -64,14 +65,14 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		sendProgress(map[string]string{"status": "error", "message": msg})
 	}
 
-	// 1. Decode
+	// Decode JSON
 	var req ConversionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		sendError("Invalid request JSON")
 		return
 	}
 
-	// 2. Auth
+	// Auth
 	token := r.Header.Get("X-DAB-Token")
 	if token == "" {
 		sendError("Missing X-DAB-Token")
@@ -86,10 +87,10 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Extract
+	// Extract tracks
 	parsedURL, _ := url.ParseRequestURI(req.URL)
 	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
-	
+
 	var tracks []models.Track
 	var sourceName string
 
@@ -116,39 +117,41 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Create Lib
-	libID, err := client.CreateLibrary(sourceName)
-	if err != nil {
-		sendError("Lib creation failed")
-		return
+	// Determine library: use existing or create new
+	var libID string
+	if req.LibID != "" {
+		libID = req.LibID
+		sendProgress(map[string]string{"status": "info", "message": "Appending tracks to existing library"})
+	} else {
+		libID, err = client.CreateLibrary(sourceName)
+		if err != nil {
+			sendError("Lib creation failed")
+			return
+		}
 	}
 
-	// 5. Match & Add
+	// Match & Add tracks
 	var matchedTracks []models.MatchResult
 	for i, t := range tracks {
 		res := matcher.MatchTrack(db, client, t, req.MatchingMode)
-		
+
 		status := "NOT_FOUND"
 		if res.MatchStatus == "FOUND" && res.DabTrackID != nil {
-		    var err error
-    
- 		   // Logic: If we just fuzzy matched, we have the full 'RawTrack'
-		    // If we matched via SQLite, we only have the ID string
-		    if res.RawTrack != nil {
-		        if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
-     		       err = client.AddTrackToLibrary(libID, *dt)
-   		     }
- 		   } else {
- 		       err = client.AddTrackByID(libID, *res.DabTrackID)
-		    }
+			var err error
+			if res.RawTrack != nil {
+				if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
+					err = client.AddTrackToLibrary(libID, *dt)
+				}
+			} else {
+				err = client.AddTrackByID(libID, *res.DabTrackID)
+			}
 
- 		   if err == nil {
- 		       status = "ADDED"
-		    } else {
-        status = "DAB_ERROR"
- 		   }
+			if err == nil {
+				status = "ADDED"
+			} else {
+				status = "DAB_ERROR"
+			}
 		}
-
 
 		matchedTracks = append(matchedTracks, *res)
 		sendProgress(map[string]interface{}{
@@ -159,7 +162,13 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// 6. Final Report
+	// Optional Force Sync
+	if req.ForceSync {
+		performForceSync(db, client, libID, tracks, sourceName)
+		sendProgress(map[string]string{"status": "info", "message": "Force sync completed"})
+	}
+
+	// Final report
 	report := models.Report{
 		UserID:       userID,
 		Library:      models.LibraryInfo{ID: libID, Name: sourceName},
