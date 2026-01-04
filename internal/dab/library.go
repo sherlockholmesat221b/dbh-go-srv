@@ -1,35 +1,32 @@
 package dab
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"dbh-go-srv/internal/models"
 )
 
+// GetLibraryTracks fetches all tracks currently in a DAB library.
+// This is essential for the Force Sync "Pruning" logic.
+func (c *Client) GetLibraryTracks(libraryID string) ([]DabTrack, error) {
+	var result struct {
+		Tracks []DabTrack `json:"tracks"`
+	}
+
+	// GET /libraries/{id}/tracks
+	err := c.DoRequest("GET", fmt.Sprintf("/libraries/%s/tracks", libraryID), nil, &result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch library tracks: %w", err)
+	}
+
+	return result.Tracks, nil
+}
+
+// CreateLibrary creates a new library on DAB
 func (c *Client) CreateLibrary(name string) (string, error) {
 	payload := map[string]interface{}{
 		"name":        name,
 		"description": "Created via DABHounds Go API",
 		"isPublic":    true,
-	}
-
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/libraries", DABAPIBase)
-
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("network error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("DAB API %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -38,15 +35,16 @@ func (c *Client) CreateLibrary(name string) (string, error) {
 		} `json:"library"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode library response: %w", err)
+	err := c.DoRequest("POST", "/libraries", payload, &result)
+	if err != nil {
+		return "", err
 	}
 
 	return result.Library.ID, nil
 }
 
+// AddTrackToLibrary - Preserves your EXACT schema for full track metadata
 func (c *Client) AddTrackToLibrary(libraryID string, track DabTrack) error {
-	// Replicating the EXACT AddTrackToLibraryRequest schema
 	payload := map[string]interface{}{
 		"track": map[string]interface{}{
 			"id":          fmt.Sprintf("%d", track.ID),
@@ -55,7 +53,7 @@ func (c *Client) AddTrackToLibrary(libraryID string, track DabTrack) error {
 			"artistId":    track.ArtistID,
 			"albumTitle":  track.AlbumTitle,
 			"albumCover":  track.AlbumCover,
-			"albumId":     fmt.Sprintf("%v", track.AlbumID), // Handles alphanumeric
+			"albumId":     fmt.Sprintf("%v", track.AlbumID), 
 			"releaseDate": track.ReleaseDate,
 			"genre":       track.Genre,
 			"duration":    track.Duration,
@@ -67,21 +65,39 @@ func (c *Client) AddTrackToLibrary(libraryID string, track DabTrack) error {
 		},
 	}
 
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/libraries/%s/tracks", DABAPIBase, libraryID)
-	
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
+	return c.DoRequest("POST", fmt.Sprintf("/libraries/%s/tracks", libraryID), payload, nil)
+}
 
-	resp, err := c.Do(req)
+// AddTrackByID - Specifically for SQLite cache hits where we only have the ID
+func (c *Client) AddTrackByID(libraryID string, trackID string) error {
+	payload := map[string]interface{}{
+		"trackId": trackID,
+	}
+	return c.DoRequest("POST", fmt.Sprintf("/libraries/%s/tracks", libraryID), payload, nil)
+}
+
+// UpdateLibrary - Used for Syncing metadata (PATCH)
+func (c *Client) UpdateLibrary(id string, name string, desc string) error {
+	payload := map[string]interface{}{
+		"name":        name,
+		"description": desc,
+	}
+	return c.DoRequest("PATCH", fmt.Sprintf("/libraries/%s", id), payload, nil)
+}
+
+// RemoveTrackFromLibrary - Used for Pruning tracks in Force Sync (DELETE)
+func (c *Client) RemoveTrackFromLibrary(libID string, trackID string) error {
+	return c.DoRequest("DELETE", fmt.Sprintf("/libraries/%s/tracks/%s", libID, trackID), nil, nil)
+}
+
+// GetLibraryInfo - Fetches current state to compare titles/descriptions
+func (c *Client) GetLibraryInfo(id string) (*models.LibraryInfo, error) {
+	var result struct {
+		Library models.LibraryInfo `json:"library"`
+	}
+	err := c.DoRequest("GET", fmt.Sprintf("/libraries/%s", id), nil, &result)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("DAB Add Error (%d): %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	return &result.Library, err
 }

@@ -15,23 +15,20 @@ func ParseYouTube(url string) ([]models.Track, string, error) {
 	if err == nil {
 		var tracks []models.Track
 		
-		// The library returns a playlist object with a list of videos
 		for _, entry := range playlist.Videos {
-			// entry.Author is the Uploader
 			artist, title := NormalizeYTTitle(entry.Title, entry.Author)
 			
 			tracks = append(tracks, models.Track{
 				Title:    title,
 				Artist:   artist,
 				SourceID: entry.ID,
-				// Note: Native Go libs rarely extract ISRC as easily as yt-dlp
-				// because it requires deep metadata parsing.
+				Type:     "youtube", // Set type for registry
 			})
 		}
 		return tracks, playlist.Title, nil
 	}
 
-	// 2. Fallback: Parse as a single video if playlist parsing fails
+	// 2. Fallback: Parse as a single video
 	video, err := client.GetVideo(url)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to parse YouTube URL: %w", err)
@@ -43,6 +40,7 @@ func ParseYouTube(url string) ([]models.Track, string, error) {
 			Title:    title,
 			Artist:   artist,
 			SourceID: video.ID,
+			Type:     "youtube", // Set type for registry
 		},
 	}
 

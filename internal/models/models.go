@@ -6,6 +6,7 @@ type Track struct {
 	Album      string  `json:"album,omitempty"`
 	ISRC       string  `json:"isrc,omitempty"`
 	SourceID   string  `json:"source_id"`
+    Type       string  `json:"type"`
 	Confidence float64 `json:"confidence"`
 }
 

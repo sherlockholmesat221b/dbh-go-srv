@@ -1,18 +1,21 @@
 package dab
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
-    "fmt"
 
 	"golang.org/x/time/rate"
 )
 
 const (
-	UserAgent   = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/1337.0.0.0 Safari/537.36"
-	DABAPIBase  = "https://dabmusic.xyz/api"
+	UserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/1337.0.0.0 Safari/537.36"
+	DABAPIBase = "https://dabmusic.xyz/api"
 )
 
 type Client struct {
@@ -38,24 +41,55 @@ func GetClient(token string) *Client {
 	return instance
 }
 
+// Do handles the low-level HTTP headers and rate limiting
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	c.Limiter.Wait(context.Background())
 
-	// 1. Set the exact UA again
 	req.Header.Set("User-Agent", UserAgent)
-
-	// 2. Auth: Some APIs are picky about "Bearer " vs "bearer " or just the token.
-    // Based on your curl, "Bearer " is correct.
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-    
-    // 3. IMPORTANT: Explicitly set the Cookie header string 
-    // Sometimes req.AddCookie acts differently than a manual header set in Go
-    req.Header.Set("Cookie", fmt.Sprintf("session=%s", c.Token))
+	
+	// Manual Cookie header as requested
+	req.Header.Set("Cookie", fmt.Sprintf("session=%s", c.Token))
 
-	// 4. Mimic Browser more closely
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json") // Added for PATCH/POST support
 	req.Header.Set("Referer", "https://dabmusic.xyz/")
 	req.Header.Set("Origin", "https://dabmusic.xyz")
 
 	return c.HTTPClient.Do(req)
+}
+
+// DoRequest is a high-level helper to handle JSON body encoding/decoding
+func (c *Client) DoRequest(method, path string, body interface{}, result interface{}) error {
+	url := DABAPIBase + path
+	var bodyReader io.Reader
+
+	if body != nil {
+		jsonBytes, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewBuffer(jsonBytes)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("DAB API error: status %d", resp.StatusCode)
+	}
+
+	if result != nil {
+		return json.NewDecoder(resp.Body).Decode(result)
+	}
+
+	return nil
 }

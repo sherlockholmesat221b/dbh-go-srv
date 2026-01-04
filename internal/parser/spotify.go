@@ -104,6 +104,7 @@ func (p *SpotifyParser) transform(st spotify.FullTrack) models.Track {
 		Artist:   strings.Join(artists, ", "),
 		Album:    st.Album.Name,
 		ISRC:     st.ExternalIDs["isrc"],
+        Type:     "spotify",
 		SourceID: string(st.ID),
 	}
 }

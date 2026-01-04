@@ -39,6 +39,7 @@ type ConversionRequest struct {
 	URL          string `json:"url"`
 	Type         string `json:"type"`
 	MatchingMode string `json:"matching_mode"`
+    ForceSync    bool   `json:"force_sync"`
 }
 
 func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -129,10 +130,25 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		
 		status := "NOT_FOUND"
 		if res.MatchStatus == "FOUND" && res.DabTrackID != nil {
-			if err := client.AddTrackToLibrary(libID, *res.DabTrackID); err == nil {
-				status = "ADDED"
-			}
+		    var err error
+    
+ 		   // Logic: If we just fuzzy matched, we have the full 'RawTrack'
+		    // If we matched via SQLite, we only have the ID string
+		    if res.RawTrack != nil {
+		        if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
+     		       err = client.AddTrackToLibrary(libID, *dt)
+   		     }
+ 		   } else {
+ 		       err = client.AddTrackByID(libID, *res.DabTrackID)
+		    }
+
+ 		   if err == nil {
+ 		       status = "ADDED"
+		    } else {
+        status = "DAB_ERROR"
+ 		   }
 		}
+
 
 		matchedTracks = append(matchedTracks, *res)
 		sendProgress(map[string]interface{}{
@@ -153,6 +169,40 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		Tracks:       matchedTracks,
 	}
 	sendProgress(map[string]interface{}{"status": "complete", "report": report})
+}
+
+func performForceSync(db *sql.DB, client *dab.Client, libID string, sourceTracks []models.Track, sourceName string) {
+	// 1. Sync Library Metadata (Title)
+	currentLib, err := client.GetLibraryInfo(libID)
+	if err == nil && currentLib.Name != sourceName {
+		_ = client.UpdateLibrary(libID, sourceName, "Synced from DABHounds")
+	}
+
+	// 2. Fetch current tracks in DAB Library
+	dabTracks, err := client.GetLibraryTracks(libID) // Assuming this returns []dab.DabTrack
+	if err != nil {
+		return
+	}
+
+	// 3. Create a map of "Should Exist" Source IDs
+	shouldExist := make(map[string]bool)
+	for _, t := range sourceTracks {
+		shouldExist[t.SourceID] = true
+	}
+
+	// 4. Prune: Remove tracks from DAB that aren't in Source
+	for _, dt := range dabTracks {
+		// Use SQLite to find which SourceID this DAB ID belongs to
+		// We query by DAB ID to get the Spotify/YouTube ID
+		var sID string
+		err := db.QueryRow("SELECT spotify_id FROM track_registry WHERE dab_id = ? UNION SELECT youtube_id FROM track_registry WHERE dab_id = ?", dt.ID).Scan(&sID)
+		
+		if err == nil && sID != "" {
+			if !shouldExist[sID] {
+				_ = client.RemoveTrackFromLibrary(libID, fmt.Sprintf("%d", dt.ID))
+			}
+		}
+	}
 }
 
 func main() {
