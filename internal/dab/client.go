@@ -56,3 +56,32 @@ func (c *Client) Search(query string) []DabTrack {
 	}
 	return result.Tracks
 }
+
+func (c *Client) ValidateToken() (string, error) {
+	url := fmt.Sprintf("%s/auth/me", DABAPIBase)
+	req, _ := http.NewRequest("GET", url, nil)
+	
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// The API returns 200 even for invalid sessions, so we check the body
+	var result struct {
+		User *struct { // Use a pointer here to check for null
+			ID interface{} `json:"id"`
+		} `json:"user"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to parse auth response")
+	}
+
+	// CRITICAL FIX: Check if user object exists
+	if result.User == nil {
+		return "", fmt.Errorf("invalid or expired DAB session")
+	}
+
+	return fmt.Sprintf("%v", result.User.ID), nil
+}

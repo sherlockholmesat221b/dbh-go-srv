@@ -2,10 +2,10 @@ package main
 
 import (
 	"encoding/json"
-    "strings"
 	"fmt"
 	"net/http"
-    "net/url"
+	"net/url"
+	"strings"
 	"time"
 
 	"dbh-go-srv/internal/dab"
@@ -41,26 +41,14 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		sendProgress(map[string]string{"status": "error", "message": msg})
 	}
 
-	// 1. Decode Request
-    var req ConversionRequest
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        sendError("Invalid request JSON")
-        return
-    }
+	// --- 1. DECODE REQUEST ---
+	var req ConversionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendError("Invalid request JSON")
+		return
+	}
 
-    // Security: Validate the URL format
-    parsedURL, err := url.ParseRequestURI(req.URL)
-    if err != nil || !strings.Contains(parsedURL.Host, "youtube.com") && !strings.Contains(parsedURL.Host, "youtu.be") {
-        if req.Type == "youtube" {
-        sendError("Invalid YouTube URL")
-        return
-        }
-    }
-
-    // Only use the validated string version
-    cleanURL := parsedURL.String()
-
-	// 2. Auth check
+	// --- 2. AUTHENTICATION & JWT VALIDATION (CRITICAL) ---
 	token := r.Header.Get("X-DAB-Token")
 	if token == "" {
 		sendError("Missing X-DAB-Token header")
@@ -68,23 +56,48 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	}
 	client := dab.GetClient(token)
 
-	// 3. Extract Tracks
-	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
+	// Validate the token and get the user info before any resource-heavy work
+	sendProgress(map[string]string{"status": "info", "message": "Verifying DAB session..."})
+	userID, err := client.ValidateToken()
+	if err != nil {
+		sendError("Authentication failed: " + err.Error())
+		return
+	}
+	sendProgress(map[string]string{"status": "info", "message": "✓ Authenticated as User " + userID})
+
+	// --- 3. URL VALIDATION ---
+	parsedURL, err := url.ParseRequestURI(req.URL)
+	if err != nil {
+		sendError("Invalid URL format")
+		return
+	}
+	cleanURL := parsedURL.String()
+
+	// --- 4. EXTRACTION ---
+	sendProgress(map[string]string{"status": "extracting", "message": "Parsing source: " + req.Type})
 	var tracks []models.Track
 	var sourceName string
 
 	switch req.Type {
 	case "spotify":
-		tracks, sourceName, err = parser.ParseSpotify(req.URL)
+		if !strings.Contains(parsedURL.Host, "spotify.com") && !strings.Contains(parsedURL.Host, "open.spotify.com") {
+            sendError("Invalid Spotify URL")
+			return
+		}
+		tracks, sourceName, err = parser.ParseSpotify(cleanURL)
 	case "youtube":
+		if !strings.Contains(parsedURL.Host, "youtube.com") && !strings.Contains(parsedURL.Host, "youtu.be") {
+			sendError("Invalid YouTube URL")
+			return
+		}
 		tracks, sourceName, err = parser.ParseYouTube(cleanURL)
 	default:
-		sendError("Unsupported source type")
+		sendError("Unsupported source type: " + req.Type)
 		return
 	}
 
-	if err != nil {
-		sendError(fmt.Sprintf("Extraction failed: %v", err))
+	if err != nil || len(tracks) == 0 {
+		sendError(fmt.Sprintf("Extraction failed or empty: %v", err))
 		return
 	}
 
@@ -94,36 +107,36 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		"source": sourceName,
 	})
 
-	// 4. Create Library
+	// --- 5. LIBRARY CREATION ---
 	if sourceName == "" {
 		sourceName = "DABHounds " + time.Now().Format("2006-01-02 15:04")
 	}
 
+	sendProgress(map[string]string{"status": "info", "message": "Creating DAB library..."})
 	libID, err := client.CreateLibrary(sourceName)
 	if err != nil {
-		sendError(fmt.Sprintf("Library creation failed: %v", err))
+		sendError("Library creation failed: " + err.Error())
 		return
 	}
 
-	// 5. Match and Add
+	// --- 6. MATCHING AND ADDING ---
 	var matchedTracks []models.MatchResult
 	for i, t := range tracks {
 		res := matcher.MatchTrack(client, t, req.MatchingMode)
-		matchedTracks = append(matchedTracks, *res)
-
-		currentStatus := "NOT_FOUND"
-
+		
+		status := "NOT_FOUND"
 		if res.MatchStatus == "FOUND" && res.RawTrack != nil {
-			// Type assert the interface back to DabTrack
 			if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
 				err := client.AddTrackToLibrary(libID, *dt)
 				if err == nil {
-					currentStatus = "ADDED"
+					status = "ADDED"
 				} else {
-					currentStatus = "DAB_ERROR"
+					status = "DAB_ERROR"
 				}
 			}
 		}
+
+		matchedTracks = append(matchedTracks, *res)
 
 		sendProgress(map[string]interface{}{
 			"status": "processing",
@@ -132,13 +145,14 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 			"track": map[string]string{
 				"title":  t.Title,
 				"artist": t.Artist,
-				"result": currentStatus,
+				"result": status,
 			},
 		})
 	}
 
-	// 6. Final Report
+	// --- 7. FINAL REPORT (Includes UserID) ---
 	report := models.Report{
+		UserID:       userID,
 		Library:      models.LibraryInfo{ID: libID, Name: sourceName},
 		Source:       models.SourceInfo{Type: req.Type, URL: req.URL},
 		MatchingMode: req.MatchingMode,

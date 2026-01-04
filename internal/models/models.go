@@ -17,6 +17,7 @@ type MatchResult struct {
 }
 
 type Report struct {
+    UserID       string        `json:"user_id"`
 	Library      LibraryInfo   `json:"library"`
 	Source       SourceInfo    `json:"source"`
 	MatchingMode string        `json:"matching_mode"`
