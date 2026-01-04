@@ -2,70 +2,40 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"os"
 	"strings"
-	"time"
 
 	"dbh-go-srv/internal/models"
-    "dbh-go-srv/internal/dab"
 	"github.com/zmb3/spotify/v2"
+	"github.com/zmb3/spotify/v2/auth"
+    "golang.org/x/oauth2/clientcredentials"
 )
 
-// guestTokenTransport is the missing struct definition
-type guestTokenTransport struct {
-	Token string
-}
-
-// RoundTrip injects the guest token into every Spotify API request
-func (t *guestTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "Bearer "+t.Token)
-	// Some Spotify endpoints require a specific User-Agent even for API calls
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	return http.DefaultTransport.RoundTrip(req)
-}
-
-// ParseSpotify handles public resources using a guest token
 func ParseSpotify(url string) ([]models.Track, string, error) {
-	token, err := getGuestToken()
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to get guest token: %w", err)
+	ctx := context.Background()
+
+	// 1. Fetch credentials from Environment Variables
+	clientID := os.Getenv("SPOTIFY_ID")
+	clientSecret := os.Getenv("SPOTIFY_SECRET")
+
+	if clientID == "" || clientSecret == "" {
+		return nil, "", fmt.Errorf("spotify credentials missing (SPOTIFY_ID/SPOTIFY_SECRET)")
 	}
 
-	httpClient := &http.Client{
-		Transport: &guestTokenTransport{Token: token},
-		Timeout:   15 * time.Second,
+	// 2. Setup Official Auth
+	config := &clientcredentials.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		TokenURL:     spotifyauth.TokenURL,
 	}
+
+	// The library automatically handles token refreshing
+	httpClient := config.Client(ctx)
 	client := spotify.New(httpClient)
 
 	p := &SpotifyParser{client: client}
 	return p.extract(url)
-}
-
-
-func getGuestToken() (string, error) {
-	req, _ := http.NewRequest("GET", "https://open.spotify.com/get_access_token?reason=transport&productType=web_player", nil)
-	
-    // MUST use the exact UA defined in dab package
-	req.Header.Set("User-Agent", dab.UserAgent)
-	req.Header.Set("Referer", "https://open.spotify.com/")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil { return "", err }
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("spotify token service returned status %d", resp.StatusCode)
-	}
-
-	var res struct {
-		AccessToken string `json:"accessToken"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", fmt.Errorf("failed to parse guest token: %w", err)
-	}
-	return res.AccessToken, nil
 }
 
 type SpotifyParser struct {
@@ -74,12 +44,17 @@ type SpotifyParser struct {
 
 func (p *SpotifyParser) extract(url string) ([]models.Track, string, error) {
 	ctx := context.Background()
+	
+	// Better parsing using the official library's logic
 	parts := strings.Split(url, "/")
+	if len(parts) < 2 {
+		return nil, "", fmt.Errorf("invalid spotify URL")
+	}
 	rawID := strings.Split(parts[len(parts)-1], "?")[0]
 	id := spotify.ID(rawID)
 
 	switch {
-	case strings.Contains(url, "playlist"):
+	case strings.Contains(url, "/playlist/"):
 		res, err := p.client.GetPlaylist(ctx, id)
 		if err != nil {
 			return nil, "", err
@@ -90,22 +65,24 @@ func (p *SpotifyParser) extract(url string) ([]models.Track, string, error) {
 		}
 		return tracks, res.Name, nil
 
-	case strings.Contains(url, "album"):
+	case strings.Contains(url, "/album/"):
 		res, err := p.client.GetAlbum(ctx, id)
 		if err != nil {
 			return nil, "", err
 		}
 		var tracks []models.Track
 		for _, item := range res.Tracks.Tracks {
+			// GetAlbum returns SimpleTracks, so we map them manually
 			tracks = append(tracks, models.Track{
 				Title:    item.Name,
 				Artist:   item.Artists[0].Name,
+				Album:    res.Name,
 				SourceID: string(item.ID),
 			})
 		}
 		return tracks, res.Name, nil
 
-	case strings.Contains(url, "track"):
+	case strings.Contains(url, "/track/"):
 		res, err := p.client.GetTrack(ctx, id)
 		if err != nil {
 			return nil, "", err

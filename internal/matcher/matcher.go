@@ -16,11 +16,15 @@ func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchRe
 		if len(res) > 0 {
 			best := findBestQuality(res)
 			idStr := fmt.Sprintf("%d", best.ID)
+			
+			// If matched by ISRC, confidence is 100%
+			t.Confidence = 1.0 
+
 			return &models.MatchResult{
 				Track:       t, 
 				MatchStatus: "FOUND", 
 				DabTrackID:  &idStr,
-				RawTrack:    &best, // Crucial: ensure ISRC match also passes metadata
+				RawTrack:    &best,
 			}
 		}
 	}
@@ -49,10 +53,10 @@ func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchRe
 	var highestScore float64
 
 	for _, cand := range results {
-		// Create a local copy so we can take a safe pointer
 		currentCand := cand
 		candStr := strings.ToLower(currentCand.Artist + " " + currentCand.Title)
 		
+		// Calculate the score
 		score := strutil.Similarity(query, candStr, metrics.NewJaroWinkler())
 		
 		threshold := 0.85
@@ -66,9 +70,13 @@ func MatchTrack(client *dab.Client, t models.Track, mode string) *models.MatchRe
 		}
 	}
 
-	// 5. Return result with Metadata for the 'Add' step
+	// 5. Return result with Metadata and Confidence Score
 	if bestTrack != nil {
 		idStr := fmt.Sprintf("%d", bestTrack.ID)
+		
+		// Update the confidence with the actual similarity score
+		t.Confidence = highestScore 
+
 		return &models.MatchResult{
 			Track:       t,
 			MatchStatus: "FOUND",
