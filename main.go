@@ -1,26 +1,48 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"dbh-go-srv/internal/dab"
+	"dbh-go-srv/internal/database"
 	"dbh-go-srv/internal/matcher"
 	"dbh-go-srv/internal/models"
 	"dbh-go-srv/internal/parser"
+
+	_ "github.com/mattn/go-sqlite3"
 )
+
+// RecoveryMiddleware catches panics so the server stays alive
+func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("PANIC RECOVERED: %v\n%s", err, debug.Stack())
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next(w, r)
+	}
+}
 
 type ConversionRequest struct {
 	URL          string `json:"url"`
-	Type         string `json:"type"`          // spotify | youtube | csv
-	MatchingMode string `json:"matching_mode"` // strict | lenient
+	Type         string `json:"type"`
+	MatchingMode string `json:"matching_mode"`
 }
 
-func handleConvert(w http.ResponseWriter, r *http.Request) {
+func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+	// SSE Setup
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
@@ -41,116 +63,87 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		sendProgress(map[string]string{"status": "error", "message": msg})
 	}
 
-	// --- 1. DECODE REQUEST ---
+	// 1. Decode
 	var req ConversionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		sendError("Invalid request JSON")
 		return
 	}
 
-	// --- 2. AUTHENTICATION & JWT VALIDATION (CRITICAL) ---
+	// 2. Auth
 	token := r.Header.Get("X-DAB-Token")
 	if token == "" {
-		sendError("Missing X-DAB-Token header")
+		sendError("Missing X-DAB-Token")
 		return
 	}
 	client := dab.GetClient(token)
 
-	// Validate the token and get the user info before any resource-heavy work
-	sendProgress(map[string]string{"status": "info", "message": "Verifying DAB session..."})
+	sendProgress(map[string]string{"status": "info", "message": "Verifying session..."})
 	userID, err := client.ValidateToken()
 	if err != nil {
-		sendError("Authentication failed: " + err.Error())
+		sendError("Auth failed: " + err.Error())
 		return
 	}
-	sendProgress(map[string]string{"status": "info", "message": "✓ Authenticated as User " + userID})
 
-	// --- 3. URL VALIDATION ---
-	parsedURL, err := url.ParseRequestURI(req.URL)
-	if err != nil {
-		sendError("Invalid URL format")
-		return
-	}
-	cleanURL := parsedURL.String()
-
-	// --- 4. EXTRACTION ---
-	sendProgress(map[string]string{"status": "extracting", "message": "Parsing source: " + req.Type})
+	// 3. Extract
+	parsedURL, _ := url.ParseRequestURI(req.URL)
+	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
+	
 	var tracks []models.Track
 	var sourceName string
 
 	switch req.Type {
 	case "spotify":
-		if !strings.Contains(parsedURL.Host, "spotify.com") && !strings.Contains(parsedURL.Host, "open.spotify.com") {
-            sendError("Invalid Spotify URL")
+		if !strings.Contains(parsedURL.Host, "spotify.com") && !strings.Contains(parsedURL.Host, "googleusercontent.com") {
+			sendError("Invalid Spotify URL")
 			return
 		}
-		tracks, sourceName, err = parser.ParseSpotify(cleanURL)
+		tracks, sourceName, err = parser.ParseSpotify(req.URL)
 	case "youtube":
 		if !strings.Contains(parsedURL.Host, "youtube.com") && !strings.Contains(parsedURL.Host, "youtu.be") {
 			sendError("Invalid YouTube URL")
 			return
 		}
-		tracks, sourceName, err = parser.ParseYouTube(cleanURL)
+		tracks, sourceName, err = parser.ParseYouTube(req.URL)
 	default:
-		sendError("Unsupported source type: " + req.Type)
+		sendError("Unsupported type")
 		return
 	}
 
 	if err != nil || len(tracks) == 0 {
-		sendError(fmt.Sprintf("Extraction failed or empty: %v", err))
+		sendError("Extraction failed")
 		return
 	}
 
-	sendProgress(map[string]interface{}{
-		"status": "extracted",
-		"count":  len(tracks),
-		"source": sourceName,
-	})
-
-	// --- 5. LIBRARY CREATION ---
-	if sourceName == "" {
-		sourceName = "DABHounds " + time.Now().Format("2006-01-02 15:04")
-	}
-
-	sendProgress(map[string]string{"status": "info", "message": "Creating DAB library..."})
+	// 4. Create Lib
 	libID, err := client.CreateLibrary(sourceName)
 	if err != nil {
-		sendError("Library creation failed: " + err.Error())
+		sendError("Lib creation failed")
 		return
 	}
 
-	// --- 6. MATCHING AND ADDING ---
+	// 5. Match & Add
 	var matchedTracks []models.MatchResult
 	for i, t := range tracks {
-		res := matcher.MatchTrack(client, t, req.MatchingMode)
+		res := matcher.MatchTrack(db, client, t, req.MatchingMode)
 		
 		status := "NOT_FOUND"
-		if res.MatchStatus == "FOUND" && res.RawTrack != nil {
-			if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
-				err := client.AddTrackToLibrary(libID, *dt)
-				if err == nil {
-					status = "ADDED"
-				} else {
-					status = "DAB_ERROR"
-				}
+		if res.MatchStatus == "FOUND" && res.DabTrackID != nil {
+			if err := client.AddTrackToLibrary(libID, *res.DabTrackID); err == nil {
+				status = "ADDED"
 			}
 		}
 
 		matchedTracks = append(matchedTracks, *res)
-
 		sendProgress(map[string]interface{}{
 			"status": "processing",
 			"index":  i + 1,
 			"total":  len(tracks),
-			"track": map[string]string{
-				"title":  t.Title,
-				"artist": t.Artist,
-				"result": status,
-			},
+			"track":  map[string]string{"title": t.Title, "result": status},
 		})
 	}
 
-	// --- 7. FINAL REPORT (Includes UserID) ---
+	// 6. Final Report
 	report := models.Report{
 		UserID:       userID,
 		Library:      models.LibraryInfo{ID: libID, Name: sourceName},
@@ -163,7 +156,28 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/api/v1/convert", handleConvert)
-	fmt.Println("Server starting on :8080")
-	http.ListenAndServe(":8080", nil)
+	dbPath := "./data/registry.db"
+	os.MkdirAll(filepath.Dir(dbPath), 0755)
+
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := database.InitDatabase(db); err != nil {
+		log.Fatal(err)
+	}
+
+	// Wrap the handler with the Recovery Middleware
+	http.HandleFunc("/api/v1/convert", RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		handleConvert(db, w, r)
+	}))
+
+	log.Println("Server starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
