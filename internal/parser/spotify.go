@@ -3,19 +3,30 @@ package parser
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"dbh-go-srv/internal/models"
+	"github.com/joho/godotenv"
 	"github.com/zmb3/spotify/v2"
-	"github.com/zmb3/spotify/v2/auth"
-    "golang.org/x/oauth2/clientcredentials"
+	spotifyauth "github.com/zmb3/spotify/v2/auth"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
+var loadEnvOnce sync.Once
+
 func ParseSpotify(url string) ([]models.Track, string, error) {
+	// 1. Load .env file (only once)
+	loadEnvOnce.Do(func() {
+		if err := godotenv.Load(); err != nil {
+			log.Println("Note: No .env file found, using system environment variables")
+		}
+	})
+
 	ctx := context.Background()
 
-	// 1. Fetch credentials from Environment Variables
 	clientID := os.Getenv("SPOTIFY_ID")
 	clientSecret := os.Getenv("SPOTIFY_SECRET")
 
@@ -23,14 +34,12 @@ func ParseSpotify(url string) ([]models.Track, string, error) {
 		return nil, "", fmt.Errorf("spotify credentials missing (SPOTIFY_ID/SPOTIFY_SECRET)")
 	}
 
-	// 2. Setup Official Auth
 	config := &clientcredentials.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		TokenURL:     spotifyauth.TokenURL,
 	}
 
-	// The library automatically handles token refreshing
 	httpClient := config.Client(ctx)
 	client := spotify.New(httpClient)
 
@@ -45,7 +54,6 @@ type SpotifyParser struct {
 func (p *SpotifyParser) extract(url string) ([]models.Track, string, error) {
 	ctx := context.Background()
 	
-	// Better parsing using the official library's logic
 	parts := strings.Split(url, "/")
 	if len(parts) < 2 {
 		return nil, "", fmt.Errorf("invalid spotify URL")
@@ -72,12 +80,14 @@ func (p *SpotifyParser) extract(url string) ([]models.Track, string, error) {
 		}
 		var tracks []models.Track
 		for _, item := range res.Tracks.Tracks {
-			// GetAlbum returns SimpleTracks, so we map them manually
+			// Note: SimpleTrack doesn't have ISRC, but FullTrack does.
+			// For high-accuracy, we could fetch full track details here if needed.
 			tracks = append(tracks, models.Track{
 				Title:    item.Name,
 				Artist:   item.Artists[0].Name,
 				Album:    res.Name,
 				SourceID: string(item.ID),
+				Type:     "spotify",
 			})
 		}
 		return tracks, res.Name, nil
@@ -99,12 +109,15 @@ func (p *SpotifyParser) transform(st spotify.FullTrack) models.Track {
 	for _, a := range st.Artists {
 		artists = append(artists, a.Name)
 	}
+	// The ISRC is the "golden key" for the registry and Qobuz matching
+	isrc := st.ExternalIDs["isrc"]
+
 	return models.Track{
 		Title:    st.Name,
 		Artist:   strings.Join(artists, ", "),
 		Album:    st.Album.Name,
-		ISRC:     st.ExternalIDs["isrc"],
-        Type:     "spotify",
+		ISRC:     isrc,
+		Type:     "spotify",
 		SourceID: string(st.ID),
 	}
 }

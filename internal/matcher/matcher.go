@@ -3,7 +3,6 @@ package matcher
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 
 	"dbh-go-srv/internal/dab"
@@ -14,95 +13,74 @@ import (
 	"github.com/adrg/strutil/metrics"
 )
 
-// MatchTrack checks the SQLite registry first, then tries ISRC, and finally falls back to fuzzy matching.
 func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *models.MatchResult {
-	// --- STEP 0: Check SQLite Registry (Fail-Safe) ---
+	// 1. Check SQLite Registry first
 	if db != nil {
 		cachedID, err := database.GetDabIDFromSource(db, t.Type, t.SourceID)
 		if err == nil && cachedID != "" {
-			t.Confidence = 1.0 // Cached matches are considered verified
 			return &models.MatchResult{
 				Track:       t,
 				MatchStatus: "FOUND",
 				DabTrackID:  &cachedID,
 			}
 		}
-		// If there's a DB error (like a lock), we don't crash; we just log it and move to Step 1.
-		if err != nil && err != sql.ErrNoRows {
-			log.Printf("Database lookup skipped for %s: %v", t.Title, err)
-		}
 	}
 
-	// --- STEP 1: Try ISRC Match ---
-	if t.ISRC != "" {
-		res := client.Search(t.ISRC)
-		if len(res) > 0 {
-			best := findBestQuality(res)
-			idStr := fmt.Sprintf("%d", best.ID)
-			t.Confidence = 1.0
-
-			// Save to Registry asynchronously (ignoring error to prevent blocking)
-			_ = database.UpsertMapping(db, database.TrackMapping{
-				DabID:     idStr,
-				ISRC:      t.ISRC,
-				SpotifyID: iif(t.Type == "spotify", t.SourceID, ""),
-				YoutubeID: iif(t.Type == "youtube", t.SourceID, ""),
-			})
-
-			return &models.MatchResult{
-				Track:       t,
-				MatchStatus: "FOUND",
-				DabTrackID:  &idStr,
-				RawTrack:    &best,
+	// 2. Metadata Enrichment: If YouTube, try to get ISRC from MusicBrainz
+	if t.Type == "youtube" && t.ISRC == "" {
+		if mbISRC := GetISRCFromMetadata(t.Artist, t.Title); mbISRC != "" {
+			t.ISRC = mbISRC
+			// Double check registry again with ISRC
+			if cachedID, err := database.GetDabIDFromSource(db, "isrc", mbISRC); err == nil && cachedID != "" {
+				return &models.MatchResult{
+					Track:       t,
+					MatchStatus: "FOUND",
+					DabTrackID:  &cachedID,
+				}
 			}
 		}
 	}
 
-	// --- STEP 2 & 3: Fuzzy Search Logic ---
-	cleanTitle := t.Title
-	if idx := strings.IndexAny(cleanTitle, "(["); idx != -1 {
-		cleanTitle = strings.TrimSpace(cleanTitle[:idx])
+	// 3. Search (Qobuz w/ DAB Fallback)
+	query := t.Artist + " " + t.Title
+	if t.ISRC != "" {
+		query = t.ISRC // ISRC provides 100% precision on Qobuz/DAB
 	}
-
-	query := strings.ToLower(t.Artist + " " + cleanTitle)
+	
 	results := client.Search(query)
-
-	if len(results) == 0 && cleanTitle != t.Title {
-		query = strings.ToLower(t.Artist + " " + t.Title)
-		results = client.Search(query)
-	}
-
 	if len(results) == 0 {
 		return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
 	}
 
-	// --- STEP 4: Fuzzy Matching Loop ---
-	var bestTrack *dab.DabTrack
+	// 4. Fuzzy Matching Logic
+	var bestMatch *dab.DabTrack
 	var highestScore float64
 
-	for _, cand := range results {
-		currentCand := cand
-		candStr := strings.ToLower(currentCand.Artist + " " + currentCand.Title)
-		score := strutil.Similarity(query, candStr, metrics.NewJaroWinkler())
+	target := strings.ToLower(t.Artist + " " + t.Title)
 
+	for _, cand := range results {
+		candStr := strings.ToLower(cand.Artist + " " + cand.Title)
+		score := strutil.Similarity(target, candStr, metrics.NewJaroWinkler())
+		
 		threshold := 0.85
-		if mode == "strict" {
-			threshold = 0.95
+		if mode == "strict" { threshold = 0.95 }
+
+		// If we have an ISRC match, we treat it as a perfect 1.0
+		if t.ISRC != "" && query == t.ISRC {
+			score = 1.0
 		}
 
-		if score > highestScore && score >= threshold {
+		if score >= threshold && score > highestScore {
 			highestScore = score
-			bestTrack = &currentCand
+			copyCand := cand
+			bestMatch = &copyCand
 		}
 	}
 
-	// --- STEP 5: Return & Cache Result ---
-	if bestTrack != nil {
-		idStr := fmt.Sprintf("%d", bestTrack.ID)
-		t.Confidence = highestScore
-
-		// Store this fuzzy match in the DB so it's "Instant" for the next user
-		_ = database.UpsertMapping(db, database.TrackMapping{
+	if bestMatch != nil {
+		idStr := fmt.Sprintf("%d", bestMatch.ID)
+		// 5. Update Registry Async for future speed
+		go database.UpsertMapping(db, database.TrackMapping{
 			DabID:     idStr,
 			ISRC:      t.ISRC,
 			SpotifyID: iif(t.Type == "spotify", t.SourceID, ""),
@@ -113,20 +91,18 @@ func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *mo
 			Track:       t,
 			MatchStatus: "FOUND",
 			DabTrackID:  &idStr,
-			RawTrack:    bestTrack,
+			RawTrack:    bestMatch,
 		}
 	}
 
 	return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
 }
 
-// Helper to handle the mapping logic
 func iif(condition bool, a, b string) string {
-	if condition {
-		return a
-	}
+	if condition { return a }
 	return b
 }
+
 
 func findBestQuality(tracks []dab.DabTrack) dab.DabTrack {
 	best := tracks[0]

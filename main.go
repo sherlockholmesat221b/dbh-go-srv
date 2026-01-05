@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+    "github.com/joho/godotenv"
 
 	"dbh-go-srv/internal/dab"
 	"dbh-go-srv/internal/database"
@@ -39,8 +40,6 @@ type ConversionRequest struct {
 	URL          string `json:"url"`
 	Type         string `json:"type"`
 	MatchingMode string `json:"matching_mode"`
-	ForceSync    bool   `json:"force_sync"`
-	LibID        string `json:"lib_id,omitempty"` // optional, append tracks if provided
 }
 
 func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -54,6 +53,7 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // Adjust for production
 
 	sendProgress := func(data interface{}) {
 		b, _ := json.Marshal(data)
@@ -88,7 +88,12 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract tracks
-	parsedURL, _ := url.ParseRequestURI(req.URL)
+	parsedURL, err := url.ParseRequestURI(req.URL)
+	if err != nil {
+		sendError("Invalid URL format")
+		return
+	}
+
 	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
 
 	var tracks []models.Track
@@ -96,6 +101,7 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	switch req.Type {
 	case "spotify":
+		// Basic host validation
 		if !strings.Contains(parsedURL.Host, "spotify.com") && !strings.Contains(parsedURL.Host, "googleusercontent.com") {
 			sendError("Invalid Spotify URL")
 			return
@@ -108,127 +114,67 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		}
 		tracks, sourceName, err = parser.ParseYouTube(req.URL)
 	default:
-		sendError("Unsupported type")
+		sendError("Unsupported source type: " + req.Type)
 		return
 	}
 
-	if err != nil || len(tracks) == 0 {
-		sendError("Extraction failed")
+	if err != nil {
+		sendError("Extraction failed: " + err.Error())
+		return
+	}
+	if len(tracks) == 0 {
+		sendError("No tracks found in the provided source")
 		return
 	}
 
-	// Determine library: use existing or create new
-	var libID string
-	if req.LibID != "" {
-		libID = req.LibID
-		sendProgress(map[string]string{"status": "info", "message": "Appending tracks to existing library"})
-	} else {
-		libID, err = client.CreateLibrary(sourceName)
-		if err != nil {
-			sendError("Lib creation failed")
-			return
-		}
-	}
-
-	// Match & Add tracks
-	var matchedTracks []models.MatchResult
+	// Match tracks and stream results back
+	var results []models.MatchResult
 	for i, t := range tracks {
 		res := matcher.MatchTrack(db, client, t, req.MatchingMode)
+		results = append(results, *res)
 
-		status := "NOT_FOUND"
-		if res.MatchStatus == "FOUND" && res.DabTrackID != nil {
-			var err error
-			if res.RawTrack != nil {
-				if dt, ok := res.RawTrack.(*dab.DabTrack); ok {
-					err = client.AddTrackToLibrary(libID, *dt)
-				}
-			} else {
-				err = client.AddTrackByID(libID, *res.DabTrackID)
-			}
-
-			if err == nil {
-				status = "ADDED"
-			} else {
-				status = "DAB_ERROR"
-			}
-		}
-
-		matchedTracks = append(matchedTracks, *res)
+		// Send per-track update so client can update UI in real-time
 		sendProgress(map[string]interface{}{
 			"status": "processing",
 			"index":  i + 1,
 			"total":  len(tracks),
-			"track":  map[string]string{"title": t.Title, "result": status},
+			"result": res, // Contains MatchStatus and DabTrack data
 		})
 	}
 
-	// Optional Force Sync
-	if req.ForceSync {
-		performForceSync(db, client, libID, tracks, sourceName)
-		sendProgress(map[string]string{"status": "info", "message": "Force sync completed"})
+	// Final report with metadata for the client to use in library creation
+	report := map[string]interface{}{
+		"status": "complete",
+		"meta": map[string]interface{}{
+			"user_id":     userID,
+			"source_name": sourceName,
+			"source_url":  req.URL,
+			"timestamp":   time.Now().Format(time.RFC3339),
+		},
+		"tracks": results,
 	}
-
-	// Final report
-	report := models.Report{
-		UserID:       userID,
-		Library:      models.LibraryInfo{ID: libID, Name: sourceName},
-		Source:       models.SourceInfo{Type: req.Type, URL: req.URL},
-		MatchingMode: req.MatchingMode,
-		Timestamp:    time.Now().Format(time.RFC3339),
-		Tracks:       matchedTracks,
-	}
-	sendProgress(map[string]interface{}{"status": "complete", "report": report})
-}
-
-func performForceSync(db *sql.DB, client *dab.Client, libID string, sourceTracks []models.Track, sourceName string) {
-	// 1. Sync Library Metadata (Title)
-	currentLib, err := client.GetLibraryInfo(libID)
-	if err == nil && currentLib.Name != sourceName {
-		_ = client.UpdateLibrary(libID, sourceName, "Synced from DABHounds")
-	}
-
-	// 2. Fetch current tracks in DAB Library
-	dabTracks, err := client.GetLibraryTracks(libID) // Assuming this returns []dab.DabTrack
-	if err != nil {
-		return
-	}
-
-	// 3. Create a map of "Should Exist" Source IDs
-	shouldExist := make(map[string]bool)
-	for _, t := range sourceTracks {
-		shouldExist[t.SourceID] = true
-	}
-
-	// 4. Prune: Remove tracks from DAB that aren't in Source
-	for _, dt := range dabTracks {
-		// Use SQLite to find which SourceID this DAB ID belongs to
-		// We query by DAB ID to get the Spotify/YouTube ID
-		var sID string
-		err := db.QueryRow("SELECT spotify_id FROM track_registry WHERE dab_id = ? UNION SELECT youtube_id FROM track_registry WHERE dab_id = ?", dt.ID).Scan(&sID)
-		
-		if err == nil && sID != "" {
-			if !shouldExist[sID] {
-				_ = client.RemoveTrackFromLibrary(libID, fmt.Sprintf("%d", dt.ID))
-			}
-		}
-	}
+	sendProgress(report)
 }
 
 func main() {
+    // 1. Load .env file at the absolute start
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: No .env file found; using system environment variables")
+	}
 	dbPath := "./data/registry.db"
-	os.MkdirAll(filepath.Dir(dbPath), 0755)
+	_ = os.MkdirAll(filepath.Dir(dbPath), 0755)
 
+	// Open DB with WAL mode for better concurrency during matches
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
 
 	if err := database.InitDatabase(db); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
-	// Wrap the handler with the Recovery Middleware
 	http.HandleFunc("/api/v1/convert", RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -237,6 +183,11 @@ func main() {
 		handleConvert(db, w, r)
 	}))
 
-	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("DBH Matcher Engine starting on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

@@ -4,6 +4,7 @@ go 1.25.4
 
 require (
 	github.com/adrg/strutil v0.3.1
+	github.com/joho/godotenv v1.5.1
 	github.com/kkdai/youtube/v2 v2.10.5
 	github.com/mattn/go-sqlite3 v1.14.33
 	github.com/zmb3/spotify/v2 v2.4.3
