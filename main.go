@@ -54,6 +54,7 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*") // Adjust for production
+	contentType := r.Header.Get("Content-Type")
 
 	sendProgress := func(data interface{}) {
 		b, _ := json.Marshal(data)
@@ -65,14 +66,93 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		sendProgress(map[string]string{"status": "error", "message": msg})
 	}
 
-	// Decode JSON
-	var req ConversionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendError("Invalid request JSON")
+	// ---- Shared variables ----
+	var (
+		tracks     []models.Track
+		sourceName string
+		reqType    string
+		matchMode  string
+		err        error
+	)
+
+	// ---- CSV (multipart) ----
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			sendError("Invalid multipart form")
+			return
+		}
+
+		reqType = r.FormValue("type")
+		matchMode = r.FormValue("matching_mode")
+
+		if reqType != "csv" {
+			sendError("multipart requests only supported for type=csv")
+			return
+		}
+
+		tracks, sourceName, err = parser.ParseCSV(r)
+		if err != nil {
+			sendError("CSV parse failed: " + err.Error())
+			return
+		}
+
+	// ---- JSON (Spotify / YouTube) ----
+	} else {
+		var req ConversionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			sendError("Invalid request JSON")
+			return
+		}
+
+		reqType = req.Type
+		matchMode = req.MatchingMode
+
+		parsedURL, err := url.ParseRequestURI(req.URL)
+		if err != nil {
+			sendError("Invalid URL format")
+			return
+		}
+
+		sendProgress(map[string]string{
+			"status":  "extracting",
+			"message": "Parsing " + reqType,
+		})
+
+		switch reqType {
+		case "spotify":
+			if !strings.Contains(parsedURL.Host, "spotify.com") &&
+				!strings.Contains(parsedURL.Host, "googleusercontent.com") {
+				sendError("Invalid Spotify URL")
+				return
+			}
+			tracks, sourceName, err = parser.ParseSpotify(req.URL)
+
+		case "youtube":
+			if !strings.Contains(parsedURL.Host, "youtube.com") &&
+				!strings.Contains(parsedURL.Host, "youtu.be") {
+				sendError("Invalid YouTube URL")
+				return
+			}
+			tracks, sourceName, err = parser.ParseYouTube(req.URL)
+
+		default:
+			sendError("Unsupported source type: " + reqType)
+			return
+		}
+
+		if err != nil {
+			sendError("Extraction failed: " + err.Error())
+			return
+		}
+	}
+
+	// ---- Post-parsing validation ----
+	if len(tracks) == 0 {
+		sendError("No tracks found")
 		return
 	}
 
-	// Auth
+	// ---- Auth ----
 	token := r.Header.Get("X-DAB-Token")
 	if token == "" {
 		sendError("Missing X-DAB-Token")
@@ -87,68 +167,27 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract tracks
-	parsedURL, err := url.ParseRequestURI(req.URL)
-	if err != nil {
-		sendError("Invalid URL format")
-		return
-	}
-
-	sendProgress(map[string]string{"status": "extracting", "message": "Parsing " + req.Type})
-
-	var tracks []models.Track
-	var sourceName string
-
-	switch req.Type {
-	case "spotify":
-		// Basic host validation
-		if !strings.Contains(parsedURL.Host, "spotify.com") && !strings.Contains(parsedURL.Host, "googleusercontent.com") {
-			sendError("Invalid Spotify URL")
-			return
-		}
-		tracks, sourceName, err = parser.ParseSpotify(req.URL)
-	case "youtube":
-		if !strings.Contains(parsedURL.Host, "youtube.com") && !strings.Contains(parsedURL.Host, "youtu.be") {
-			sendError("Invalid YouTube URL")
-			return
-		}
-		tracks, sourceName, err = parser.ParseYouTube(req.URL)
-	default:
-		sendError("Unsupported source type: " + req.Type)
-		return
-	}
-
-	if err != nil {
-		sendError("Extraction failed: " + err.Error())
-		return
-	}
-	if len(tracks) == 0 {
-		sendError("No tracks found in the provided source")
-		return
-	}
-
-	// Match tracks and stream results back
+	// ---- Track matching ----
 	var results []models.MatchResult
 	for i, t := range tracks {
-		res := matcher.MatchTrack(db, client, t, req.MatchingMode)
+		res := matcher.MatchTrack(db, client, t, matchMode)
 		results = append(results, *res)
 
-		// Send per-track update so client can update UI in real-time
 		sendProgress(map[string]interface{}{
 			"status": "processing",
 			"index":  i + 1,
 			"total":  len(tracks),
-			"result": res, // Contains MatchStatus and DabTrack data
+			"result": res,
 		})
 	}
 
-	// Final report with metadata for the client to use in library creation
+	// ---- Final report ----
 	report := map[string]interface{}{
 		"status": "complete",
 		"meta": map[string]interface{}{
 			"user_id":     userID,
 			"source_name": sourceName,
-			"source_url":  req.URL,
+			"source_url":  "", // CSV has no source URL
 			"timestamp":   time.Now().Format(time.RFC3339),
 		},
 		"tracks": results,

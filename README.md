@@ -7,7 +7,7 @@ A Go-based DABHounds web server designed to convert music playlists from **Spoti
 * **Real-time Streaming**: Uses SSE to send per-track matching results to the client immediately.
 * **Dual-Layer Matching**: Searches Qobuz first for high-fidelity matches, falling back to DAB internal search.
 * **Registry Persistence**: Maps Spotify/YouTube IDs to DAB IDs in a local SQLite database to prevent redundant API calls.
-* **ISRC Pivot**: Automatically fetches ISRCs from MusicBrainz for YouTube tracks to ensure 100% matching accuracy.
+* **ISRC Pivot**: Attempts fetches ISRCs from MusicBrainz for YouTube tracks to ensure higher matching accuracy.
 * **Rate Limited**: Respects external API limits (1.5 req/s for DAB, 1 req/s for MusicBrainz).
 
 ---
@@ -47,16 +47,32 @@ PORT=8080
 * `Content-Type`: `application/json`
 
 **Body:**
-    {
-        "url": "https://open.spotify.com/playlist/...",
-        "type": "spotify",
-        "matching_mode": "strict"
-    }
+```json
+{
+    "url": "https://open.spotify.com/playlist/...",
+    "type": "spotify",
+    "matching_mode": "strict"
+}
+```
 
 **Response (SSE Stream):**
 The server returns `text/event-stream`. Each event is a JSON object:
-    data: {"status":"processing","index":1,"total":20,"result":{...}}
-    data: {"status":"complete","meta":{...},"tracks":[...]}
+```
+data: {"status":"processing","index":1,"total":20,"result":{...}}
+data: {"status":"complete","meta":{...},"tracks":[...]}
+```
+    
+### CSV Import
+
+CSV files can be uploaded via the same `/api/v1/convert` endpoint using
+`multipart/form-data`.
+
+**Required fields:**
+- `type=csv`
+- `file=@tracks.csv`
+
+Optional:
+- `matching_mode` (`strict` or `lenient`)
 
 ---
 
