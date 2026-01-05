@@ -23,6 +23,7 @@ A Go-based DABHounds web server designed to convert music playlists from **Spoti
 git clone https://github.com/sherlockholmesat221b/dbh-go-srv
 cd dbh-go-srv
 go mod tidy
+go build -o din/srv ./
 ```
 
 ### 3. Configuration
