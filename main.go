@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -12,23 +13,26 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
-    "github.com/joho/godotenv"
+
+	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 
 	"dbh-go-srv/internal/dab"
 	"dbh-go-srv/internal/database"
 	"dbh-go-srv/internal/matcher"
 	"dbh-go-srv/internal/models"
 	"dbh-go-srv/internal/parser"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
-// RecoveryMiddleware catches panics so the server stays alive
+/* =========================
+   Recovery Middleware
+   ========================= */
+
 func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				log.Printf("PANIC RECOVERED: %v\n%s", err, debug.Stack())
+				log.Printf("PANIC: %v\n%s", err, debug.Stack())
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 		}()
@@ -36,49 +40,86 @@ func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+/* =========================
+   Types
+   ========================= */
+
 type ConversionRequest struct {
 	URL          string `json:"url"`
 	Type         string `json:"type"`
 	MatchingMode string `json:"matching_mode"`
 }
 
-func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
-	// SSE Setup
+/* =========================
+   SSE Helpers
+   ========================= */
+
+func setupSSE(w http.ResponseWriter) (http.Flusher, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("streaming unsupported")
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*") // Adjust for production
-	contentType := r.Header.Get("Content-Type")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	sendProgress := func(data interface{}) {
-		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
+	return flusher, nil
+}
+
+func sendEvent(w http.ResponseWriter, flusher http.Flusher, payload any) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Println("SSE marshal error:", err)
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
+}
+
+/* =========================
+   Handler
+   ========================= */
+
+func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+	// ---- CORS Preflight ----
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-DAB-Token")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
-	sendError := func(msg string) {
-		sendProgress(map[string]string{"status": "error", "message": msg})
+	flusher, err := setupSSE(w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	// ---- Shared variables ----
+	ctx := r.Context()
+
+	send := func(v any) { sendEvent(w, flusher, v) }
+	fail := func(msg string) {
+		send(map[string]string{"status": "error", "message": msg})
+	}
+
 	var (
 		tracks     []models.Track
 		sourceName string
 		reqType    string
 		matchMode  string
-		err        error
 	)
 
-	// ---- CSV (multipart) ----
+	/* ---------- Parse Request ---------- */
+
+	contentType := r.Header.Get("Content-Type")
+
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			sendError("Invalid multipart form")
+			fail("Invalid multipart form")
 			return
 		}
 
@@ -86,34 +127,33 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		matchMode = r.FormValue("matching_mode")
 
 		if reqType != "csv" {
-			sendError("multipart requests only supported for type=csv")
+			fail("multipart only supported for type=csv")
 			return
 		}
 
 		tracks, sourceName, err = parser.ParseCSV(r)
 		if err != nil {
-			sendError("CSV parse failed: " + err.Error())
+			fail("CSV parse failed: " + err.Error())
 			return
 		}
 
-	// ---- JSON (Spotify / YouTube) ----
 	} else {
 		var req ConversionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			sendError("Invalid request JSON")
+			fail("Invalid JSON body")
 			return
 		}
 
 		reqType = req.Type
 		matchMode = req.MatchingMode
 
-		parsedURL, err := url.ParseRequestURI(req.URL)
-		if err != nil {
-			sendError("Invalid URL format")
+		parsedURL, err := url.Parse(req.URL)
+		if err != nil || parsedURL.Host == "" {
+			fail("Invalid URL")
 			return
 		}
 
-		sendProgress(map[string]string{
+		send(map[string]string{
 			"status":  "extracting",
 			"message": "Parsing " + reqType,
 		})
@@ -122,7 +162,7 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		case "spotify":
 			if !strings.Contains(parsedURL.Host, "spotify.com") &&
 				!strings.Contains(parsedURL.Host, "googleusercontent.com") {
-				sendError("Invalid Spotify URL")
+				fail("Invalid Spotify URL")
 				return
 			}
 			tracks, sourceName, err = parser.ParseSpotify(req.URL)
@@ -130,50 +170,61 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		case "youtube":
 			if !strings.Contains(parsedURL.Host, "youtube.com") &&
 				!strings.Contains(parsedURL.Host, "youtu.be") {
-				sendError("Invalid YouTube URL")
+				fail("Invalid YouTube URL")
 				return
 			}
 			tracks, sourceName, err = parser.ParseYouTube(req.URL)
 
 		default:
-			sendError("Unsupported source type: " + reqType)
+			fail("Unsupported source type")
 			return
 		}
 
 		if err != nil {
-			sendError("Extraction failed: " + err.Error())
+			fail("Extraction failed: " + err.Error())
 			return
 		}
 	}
 
-	// ---- Post-parsing validation ----
 	if len(tracks) == 0 {
-		sendError("No tracks found")
+		fail("No tracks found")
 		return
 	}
 
-	// ---- Auth ----
+	/* ---------- Auth ---------- */
+
 	token := r.Header.Get("X-DAB-Token")
 	if token == "" {
-		sendError("Missing X-DAB-Token")
+		fail("Missing X-DAB-Token")
 		return
 	}
+
 	client := dab.GetClient(token)
 
-	sendProgress(map[string]string{"status": "info", "message": "Verifying session..."})
+	send(map[string]string{"status": "info", "message": "Verifying session..."})
+
 	userID, err := client.ValidateToken()
 	if err != nil {
-		sendError("Auth failed: " + err.Error())
+		fail("Auth failed: " + err.Error())
 		return
 	}
 
-	// ---- Track matching ----
-	var results []models.MatchResult
+	/* ---------- Matching ---------- */
+
+	results := make([]models.MatchResult, 0, len(tracks))
+
 	for i, t := range tracks {
+		select {
+		case <-ctx.Done():
+			log.Println("Client disconnected")
+			return
+		default:
+		}
+
 		res := matcher.MatchTrack(db, client, t, matchMode)
 		results = append(results, *res)
 
-		sendProgress(map[string]interface{}{
+		send(map[string]any{
 			"status": "processing",
 			"index":  i + 1,
 			"total":  len(tracks),
@@ -181,52 +232,57 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// ---- Final report ----
-	report := map[string]interface{}{
+	/* ---------- Final ---------- */
+
+	send(map[string]any{
 		"status": "complete",
-		"meta": map[string]interface{}{
+		"meta": map[string]any{
 			"user_id":     userID,
 			"source_name": sourceName,
-			"source_url":  "", // CSV has no source URL
 			"timestamp":   time.Now().Format(time.RFC3339),
 		},
 		"tracks": results,
-	}
-	sendProgress(report)
+	})
 }
 
+/* =========================
+   Main
+   ========================= */
+
 func main() {
-    // 1. Load .env file at the absolute start
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: No .env file found; using system environment variables")
+		log.Println("No .env found, using environment")
 	}
+
 	dbPath := "./data/registry.db"
 	_ = os.MkdirAll(filepath.Dir(dbPath), 0755)
 
-	// Open DB with WAL mode for better concurrency during matches
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL")
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		log.Fatal(err)
 	}
 	defer db.Close()
 
 	if err := database.InitDatabase(db); err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		log.Fatal(err)
 	}
 
-	http.HandleFunc("/api/v1/convert", RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		handleConvert(db, w, r)
-	}))
+	http.HandleFunc(
+		"/api/v1/convert",
+		RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost && r.Method != http.MethodOptions {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			handleConvert(db, w, r)
+		}),
+	)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	log.Printf("DBH Matcher Engine starting on :%s", port)
+	log.Printf("DBH Matcher Engine listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

@@ -6,3 +6,6 @@ data/
 
 # .env files
 *.env
+
+# Test csv files
+*.env
