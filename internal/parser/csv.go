@@ -2,11 +2,39 @@ package parser
 
 import (
 	"encoding/csv"
-//	"fmt"
+	"errors"
 	"io"
 	"net/http"
+	"strings"
+
 	"dbh-go-srv/internal/models"
 )
+
+// canonical header mapping
+var headerAliases = map[string]string{
+	"title":               "title",
+	"track":               "title",
+	"track_title":         "title",
+	"name":                "title",
+
+	"artist":              "artist",
+	"artist_name":         "artist",
+	"performer":           "artist",
+
+	"album":               "album",
+	"album_title":         "album",
+
+	"isrc":                "isrc",
+
+	"spotify":             "spotify",
+	"spotify_uri":         "spotify",
+	"spotify_track_uri":   "spotify",
+	"uri":                 "spotify",
+}
+
+func normalize(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
 
 // ParseCSV handles multipart file uploads from the Web API
 func ParseCSV(r *http.Request) ([]models.Track, string, error) {
@@ -17,12 +45,28 @@ func ParseCSV(r *http.Request) ([]models.Track, string, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	// Skip header
-	if _, err := reader.Read(); err != nil {
+
+	// ---- Read header row ----
+	rawHeaders, err := reader.Read()
+	if err != nil {
 		return nil, "", err
 	}
 
+	columnMap := make(map[int]string)
+
+	for i, h := range rawHeaders {
+		if canonical, ok := headerAliases[normalize(h)]; ok {
+			columnMap[i] = canonical
+		}
+	}
+
+	if len(columnMap) == 0 {
+		return nil, "", errors.New("CSV has no recognizable columns")
+	}
+
 	var tracks []models.Track
+
+	// ---- Read rows ----
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -32,17 +76,40 @@ func ParseCSV(r *http.Request) ([]models.Track, string, error) {
 			return nil, "", err
 		}
 
-		// Expected order: title, artist, album, isrc
-		if len(record) < 2 {
-			continue
+		var t models.Track
+
+		for i, v := range record {
+			field, ok := columnMap[i]
+			if !ok {
+				continue
+			}
+
+			val := strings.TrimSpace(v)
+			if val == "" {
+				continue
+			}
+
+			switch field {
+			case "title":
+				t.Title = val
+			case "artist":
+				t.Artist = val
+			case "album":
+				t.Album = val
+			case "isrc":
+				t.ISRC = val
+			case "spotify":
+				if strings.HasPrefix(val, "spotify:track:") {
+					t.SourceID = val
+					t.Type = "spotify"
+				}
+			}
 		}
 
-		t := models.Track{
-			Title:  record[0],
-			Artist: record[1],
+		// Skip totally empty rows
+		if t.Title == "" && t.Artist == "" && t.SourceID == "" {
+			continue
 		}
-		if len(record) > 2 { t.Album = record[2] }
-		if len(record) > 3 { t.ISRC = record[3] }
 
 		tracks = append(tracks, t)
 	}

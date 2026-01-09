@@ -78,22 +78,23 @@ func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *mo
 	}
 
 	if bestMatch != nil {
-		idStr := fmt.Sprintf("%d", bestMatch.ID)
+	idStr := fmt.Sprintf("%d", bestMatch.ID)
 		// 5. Update Registry Async for future speed
 		go database.UpsertMapping(db, database.TrackMapping{
-			DabID:     idStr,
-			ISRC:      t.ISRC,
-			SpotifyID: iif(t.Type == "spotify", t.SourceID, ""),
-			YoutubeID: iif(t.Type == "youtube", t.SourceID, ""),
-		})
+    		DabID:     idStr,
+    		ISRC:      t.ISRC,
+	    	SpotifyID: iif(t.Type == "spotify", t.SourceID, ""),
+	     	YoutubeID: iif(t.Type == "youtube", t.SourceID, ""),
+    	})
 
-		return &models.MatchResult{
-			Track:       t,
-			MatchStatus: "FOUND",
-			DabTrackID:  &idStr,
-			RawTrack:    bestMatch,
-		}
-	}
+    	return &models.MatchResult{
+	    	Track:       t,
+	    	MatchStatus: "FOUND",
+	    	DabTrackID:  &idStr,
+	    	RawTrack:    bestMatch,
+	    	Confidence:  highestScore,
+    	}
+    }
 
 	return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
 }
