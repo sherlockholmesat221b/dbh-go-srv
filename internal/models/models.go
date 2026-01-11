@@ -7,7 +7,6 @@ type Track struct {
 	ISRC       string  `json:"isrc,omitempty"`
 	SourceID   string  `json:"source_id"`
 	Type       string  `json:"type"` // "spotify" or "youtube"
-	Confidence float64 `json:"confidence"`
 }
 
 type MatchResult struct {
@@ -15,4 +14,5 @@ type MatchResult struct {
 	MatchStatus string      `json:"match_status"`
 	DabTrackID  *string     `json:"dab_track_id"`
 	RawTrack    interface{} `json:"raw_track"` // Exported for JSON streaming
+    Confidence float64 `json:"confidence"`
 }

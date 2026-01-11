@@ -83,7 +83,10 @@ func sendEvent(w http.ResponseWriter, flusher http.Flusher, payload any) {
    ========================= */
 
 func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
-	// ---- CORS Preflight ----
+	/* =========================
+	   CORS Preflight
+	   ========================= */
+
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-DAB-Token")
@@ -92,33 +95,48 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, err := setupSSE(w)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	ctx := r.Context()
+
+	earlyFail := func(msg string, code int) {
+		http.Error(w, msg, code)
+	}
+
+	/* =========================
+	   Auth (NO SSE YET)
+	   ========================= */
+
+	token := r.Header.Get("X-DAB-Token")
+	if token == "" {
+		earlyFail("Missing X-DAB-Token", http.StatusUnauthorized)
 		return
 	}
 
-	ctx := r.Context()
+	client := dab.GetClient(token)
 
-	send := func(v any) { sendEvent(w, flusher, v) }
-	fail := func(msg string) {
-		send(map[string]string{"status": "error", "message": msg})
+	userID, err := client.ValidateToken()
+	if err != nil {
+		earlyFail("Auth failed: "+err.Error(), http.StatusUnauthorized)
+		return
 	}
+
+	/* =========================
+	   Parse Request (NO SSE)
+	   ========================= */
 
 	var (
 		tracks     []models.Track
+		results    []models.MatchResult
 		sourceName string
 		reqType    string
 		matchMode  string
 	)
 
-	/* ---------- Parse Request ---------- */
-
 	contentType := r.Header.Get("Content-Type")
 
+	// ---------- CSV (multipart) ----------
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			fail("Invalid multipart form")
+			earlyFail("Invalid multipart form", http.StatusBadRequest)
 			return
 		}
 
@@ -126,91 +144,141 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		matchMode = r.FormValue("matching_mode")
 
 		if reqType != "csv" {
-			fail("multipart only supported for type=csv")
+			earlyFail("multipart only supported for type=csv", http.StatusBadRequest)
 			return
 		}
 
-		tracks, sourceName, err = parser.ParseCSV(r)
+		// NOTE: CSV parsing does matching internally
+		// SSE will be initialized JUST BEFORE calling it
+
+		// defer SSE setup until just before ParseCSV
+
+		/* =========================
+		   SSE Setup (SAFE POINT)
+		   ========================= */
+
+		flusher, err := setupSSE(w)
 		if err != nil {
-			fail("CSV parse failed: " + err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-	} else {
-		var req ConversionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fail("Invalid JSON body")
-			return
-		}
-
-		reqType = req.Type
-		matchMode = req.MatchingMode
-
-		parsedURL, err := url.Parse(req.URL)
-		if err != nil || parsedURL.Host == "" {
-			fail("Invalid URL")
-			return
-		}
+		send := func(v any) { sendEvent(w, flusher, v) }
 
 		send(map[string]string{
-			"status":  "extracting",
-			"message": "Parsing " + reqType,
+			"status":  "info",
+			"message": "Authenticated",
 		})
 
-		switch reqType {
-		case "spotify":
-			if !strings.Contains(parsedURL.Host, "spotify.com") &&
-				!strings.Contains(parsedURL.Host, "googleusercontent.com") {
-				fail("Invalid Spotify URL")
-				return
-			}
-			tracks, sourceName, err = parser.ParseSpotify(req.URL)
-
-		case "youtube":
-			if !strings.Contains(parsedURL.Host, "youtube.com") &&
-				!strings.Contains(parsedURL.Host, "youtu.be") {
-				fail("Invalid YouTube URL")
-				return
-			}
-			tracks, sourceName, err = parser.ParseYouTube(req.URL)
-
-		default:
-			fail("Unsupported source type")
-			return
+		onProgress := func(index, total int, res *models.MatchResult) {
+			send(map[string]any{
+				"status": "processing",
+				"index":  index,
+				"total":  total,
+				"result": res,
+			})
 		}
 
+		results, sourceName, err = parser.ParseCSV(
+			r,
+			db,
+			client,
+			matchMode,
+			onProgress,
+		)
 		if err != nil {
-			fail("Extraction failed: " + err.Error())
+			send(map[string]string{
+				"status":  "error",
+				"message": "CSV parse failed: " + err.Error(),
+			})
 			return
 		}
+
+		/* ---------- Final ---------- */
+
+		send(map[string]any{
+			"status": "complete",
+			"meta": map[string]any{
+				"user_id":     userID,
+				"source_name": sourceName,
+				"timestamp":   time.Now().Format(time.RFC3339),
+			},
+			"tracks": results,
+		})
+		return
+	}
+
+	// ---------- JSON (Spotify / YouTube) ----------
+
+	var req ConversionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		earlyFail("Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	reqType = req.Type
+	matchMode = req.MatchingMode
+
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil || parsedURL.Host == "" {
+		earlyFail("Invalid URL", http.StatusBadRequest)
+		return
+	}
+
+	switch reqType {
+	case "spotify":
+		if !strings.Contains(parsedURL.Host, "spotify.com") &&
+			!strings.Contains(parsedURL.Host, "googleusercontent.com") {
+			earlyFail("Invalid Spotify URL", http.StatusBadRequest)
+			return
+		}
+		tracks, sourceName, err = parser.ParseSpotify(req.URL)
+
+	case "youtube":
+		if !strings.Contains(parsedURL.Host, "youtube.com") &&
+			!strings.Contains(parsedURL.Host, "youtu.be") {
+			earlyFail("Invalid YouTube URL", http.StatusBadRequest)
+			return
+		}
+		tracks, sourceName, err = parser.ParseYouTube(req.URL)
+
+	default:
+		earlyFail("Unsupported source type", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		earlyFail("Extraction failed: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	if len(tracks) == 0 {
-		fail("No tracks found")
+		earlyFail("No tracks found", http.StatusBadRequest)
 		return
 	}
 
-	/* ---------- Auth ---------- */
+	/* =========================
+	   SSE Setup (SAFE POINT)
+	   ========================= */
 
-	token := r.Header.Get("X-DAB-Token")
-	if token == "" {
-		fail("Missing X-DAB-Token")
-		return
-	}
-
-	client := dab.GetClient(token)
-
-	send(map[string]string{"status": "info", "message": "Verifying session..."})
-
-	userID, err := client.ValidateToken()
+	flusher, err := setupSSE(w)
 	if err != nil {
-		fail("Auth failed: " + err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	/* ---------- Matching ---------- */
+	send := func(v any) { sendEvent(w, flusher, v) }
 
-	results := make([]models.MatchResult, 0, len(tracks))
+	send(map[string]string{
+		"status":  "extracting",
+		"message": "Parsing " + reqType,
+	})
+
+	/* =========================
+	   Matching
+	   ========================= */
+
+	results = make([]models.MatchResult, 0, len(tracks))
 
 	for i, t := range tracks {
 		select {
@@ -231,7 +299,9 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	/* ---------- Final ---------- */
+	/* =========================
+	   Final
+	   ========================= */
 
 	send(map[string]any{
 		"status": "complete",
