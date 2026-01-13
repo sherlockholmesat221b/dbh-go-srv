@@ -9,3 +9,6 @@ data/
 
 # Test csv files
 *.csv
+
+# Cache files
+.cache
