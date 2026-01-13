@@ -8,4 +8,4 @@ data/
 *.env
 
 # Test csv files
-*.env
+*.csv

@@ -1,6 +1,7 @@
 package main
 
 import (
+    "context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,8 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
+    "golang.org/x/oauth2/clientcredentials"
+    "github.com/zmb3/spotify/v2"
+	spotifyauth "github.com/zmb3/spotify/v2/auth"
 
 	"dbh-go-srv/internal/dab"
 	"dbh-go-srv/internal/database"
@@ -82,7 +85,7 @@ func sendEvent(w http.ResponseWriter, flusher http.Flusher, payload any) {
    Handler
    ========================= */
 
-func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+func handleConvert(db *sql.DB, sp *parser.SpotifyParser, w http.ResponseWriter, r *http.Request) {
 	/* =========================
 	   CORS Preflight
 	   ========================= */
@@ -232,7 +235,7 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 			earlyFail("Invalid Spotify URL", http.StatusBadRequest)
 			return
 		}
-		tracks, sourceName, err = parser.ParseSpotify(req.URL)
+		tracks, sourceName, err = sp.Parse(ctx, req.URL) 
 
 	case "youtube":
 		if !strings.Contains(parsedURL.Host, "youtube.com") &&
@@ -319,33 +322,49 @@ func handleConvert(db *sql.DB, w http.ResponseWriter, r *http.Request) {
    ========================= */
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env found, using environment")
+	// 1. Validate Environment Variables (Fail fast)
+	spotifyID := os.Getenv("SPOTIFY_ID")
+	spotifySecret := os.Getenv("SPOTIFY_SECRET")
+	if spotifyID == "" || spotifySecret == "" {
+		log.Fatal("CRITICAL: SPOTIFY_ID and SPOTIFY_SECRET must be set in environment")
 	}
 
+	// 2. Database Setup
 	dbPath := "./data/registry.db"
 	_ = os.MkdirAll(filepath.Dir(dbPath), 0755)
-
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to connect to DB: %v", err)
 	}
 	defer db.Close()
 
 	if err := database.InitDatabase(db); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to init DB schema: %v", err)
 	}
 
-	http.HandleFunc(
-		"/api/v1/convert",
-		RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost && r.Method != http.MethodOptions {
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			handleConvert(db, w, r)
-		}),
-	)
+	// 3. Initialize Long-Lived Spotify Client
+	ctx := context.Background()
+	config := &clientcredentials.Config{
+		ClientID:     spotifyID,
+		ClientSecret: spotifySecret,
+		TokenURL:     spotifyauth.TokenURL,
+	}
+	httpClient := config.Client(ctx)
+	spotifyClient := spotify.New(httpClient)
+
+	// 4. Initialize Parsers
+    spotifyParser := parser.NewSpotifyParser(spotifyClient)
+
+    // 5. Routing
+    http.HandleFunc("/api/v1/convert", RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost && r.Method != http.MethodOptions {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        // PASS the parser instance here
+        handleConvert(db, spotifyParser, w, r) 
+    }))
+
 
 	port := os.Getenv("PORT")
 	if port == "" {

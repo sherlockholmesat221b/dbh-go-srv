@@ -3,120 +3,191 @@ package parser
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
 	"strings"
-	"sync"
 
 	"dbh-go-srv/internal/models"
-	"github.com/joho/godotenv"
+	"dbh-go-srv/internal/spotifetch"
 	"github.com/zmb3/spotify/v2"
-	spotifyauth "github.com/zmb3/spotify/v2/auth"
-	"golang.org/x/oauth2/clientcredentials"
 )
-
-var loadEnvOnce sync.Once
-
-func ParseSpotify(url string) ([]models.Track, string, error) {
-	// 1. Load .env file (only once)
-	loadEnvOnce.Do(func() {
-		if err := godotenv.Load(); err != nil {
-			log.Println("Note: No .env file found, using system environment variables")
-		}
-	})
-
-	ctx := context.Background()
-
-	clientID := os.Getenv("SPOTIFY_ID")
-	clientSecret := os.Getenv("SPOTIFY_SECRET")
-
-	if clientID == "" || clientSecret == "" {
-		return nil, "", fmt.Errorf("spotify credentials missing (SPOTIFY_ID/SPOTIFY_SECRET)")
-	}
-
-	config := &clientcredentials.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		TokenURL:     spotifyauth.TokenURL,
-	}
-
-	httpClient := config.Client(ctx)
-	client := spotify.New(httpClient)
-
-	p := &SpotifyParser{client: client}
-	return p.extract(url)
-}
 
 type SpotifyParser struct {
 	client *spotify.Client
 }
 
-func (p *SpotifyParser) extract(url string) ([]models.Track, string, error) {
-	ctx := context.Background()
-	
-	parts := strings.Split(url, "/")
-	if len(parts) < 2 {
-		return nil, "", fmt.Errorf("invalid spotify URL")
+func NewSpotifyParser(client *spotify.Client) *SpotifyParser {
+	return &SpotifyParser{client: client}
+}
+
+// Parse tries SpotiFLAC first, then falls back to official Spotify API
+func (p *SpotifyParser) Parse(ctx context.Context, url string) ([]models.Track, string, error) {
+	// --- Step 1: Try SpotiFLAC metadata fetch ---
+	meta, err := spotifetch.GetFilteredSpotifyData(ctx, url, false, 0)
+	if err == nil {
+		tracks, name := convertMetadataToTracks(meta)
+		return tracks, name, nil
 	}
-	rawID := strings.Split(parts[len(parts)-1], "?")[0]
-	id := spotify.ID(rawID)
 
-	switch {
-	case strings.Contains(url, "/playlist/"):
-		res, err := p.client.GetPlaylist(ctx, id)
-		if err != nil {
-			return nil, "", err
-		}
-		var tracks []models.Track
-		for _, item := range res.Tracks.Tracks {
-			tracks = append(tracks, p.transform(item.Track))
-		}
-		return tracks, res.Name, nil
+	// --- Step 2: Fallback to official Spotify Web API ---
+	id, mediaType, err := p.parseURL(url)
+	if err != nil {
+		return nil, "", fmt.Errorf("spotify parse url: %w", err)
+	}
 
-	case strings.Contains(url, "/album/"):
-		res, err := p.client.GetAlbum(ctx, id)
-		if err != nil {
-			return nil, "", err
-		}
-		var tracks []models.Track
-		for _, item := range res.Tracks.Tracks {
-			// Note: SimpleTrack doesn't have ISRC, but FullTrack does.
-			// For high-accuracy, we could fetch full track details here if needed.
-			tracks = append(tracks, models.Track{
-				Title:    item.Name,
-				Artist:   item.Artists[0].Name,
-				Album:    res.Name,
-				SourceID: string(item.ID),
-				Type:     "spotify",
-			})
-		}
-		return tracks, res.Name, nil
-
-	case strings.Contains(url, "/track/"):
-		res, err := p.client.GetTrack(ctx, id)
-		if err != nil {
-			return nil, "", err
-		}
-		return []models.Track{p.transform(*res)}, res.Name, nil
-
+	switch mediaType {
+	case "playlist":
+		return p.handlePlaylist(ctx, id)
+	case "album":
+		return p.handleAlbum(ctx, id)
+	case "track":
+		return p.handleTrack(ctx, id)
 	default:
-		return nil, "", fmt.Errorf("unsupported Spotify URL type")
+		return nil, "", fmt.Errorf("unsupported spotify type: %s", mediaType)
 	}
 }
 
-func (p *SpotifyParser) transform(st spotify.FullTrack) models.Track {
-	var artists []string
-	for _, a := range st.Artists {
-		artists = append(artists, a.Name)
+// --- Conversion from SpotiFLAC metadata to models.Track ---
+func convertMetadataToTracks(meta interface{}) ([]models.Track, string) {
+	tracks := []models.Track{}
+
+	switch v := meta.(type) {
+	case spotifetch.TrackResponse:
+		t := v.Track
+		tracks = append(tracks, models.Track{
+			Title:    t.Name,
+			Artist:   t.Artists, // Already a string in spotifetch
+			Album:    t.AlbumName,
+			ISRC:     t.ISRC,
+			SourceID: t.SpotifyID,
+			Type:     "spotify",
+		})
+		return tracks, t.Name
+
+	case *spotifetch.AlbumResponsePayload:
+		for _, t := range v.TrackList {
+			tracks = append(tracks, models.Track{
+				Title:    t.Name,
+				Artist:   t.Artists,
+				Album:    v.AlbumInfo.Name,
+				ISRC:     t.ISRC,
+				SourceID: t.SpotifyID,
+				Type:     "spotify",
+			})
+		}
+		return tracks, v.AlbumInfo.Name
+
+	case spotifetch.PlaylistResponsePayload:
+		for _, t := range v.TrackList {
+			tracks = append(tracks, models.Track{
+				Title:    t.Name,
+				Artist:   t.Artists,
+				Album:    t.AlbumName,
+				ISRC:     t.ISRC,
+				SourceID: t.SpotifyID,
+				Type:     "spotify",
+			})
+		}
+		return tracks, v.PlaylistInfo.Owner.Name // Or v.PlaylistInfo.Description
 	}
-	// The ISRC is the "golden key" for the registry and Qobuz matching
-	isrc := st.ExternalIDs["isrc"]
+
+	return nil, ""
+}
+
+// --- Original Web API functions ---
+func (p *SpotifyParser) handlePlaylist(ctx context.Context, id spotify.ID) ([]models.Track, string, error) {
+	res, err := p.client.GetPlaylist(ctx, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("get playlist: %w", err)
+	}
+
+	var tracks []models.Track
+	trackPage := res.Tracks
+	for {
+		for _, item := range trackPage.Tracks {
+			if item.Track.ID != "" && !item.IsLocal {
+				tracks = append(tracks, p.transform(item.Track))
+			}
+		}
+
+		err = p.client.NextPage(ctx, &trackPage)
+		if err == spotify.ErrNoMorePages {
+			break
+		}
+		if err != nil {
+			return tracks, res.Name, fmt.Errorf("playlist pagination error: %w", err)
+		}
+	}
+
+	return tracks, res.Name, nil
+}
+
+func (p *SpotifyParser) handleAlbum(ctx context.Context, id spotify.ID) ([]models.Track, string, error) {
+	res, err := p.client.GetAlbum(ctx, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("get album: %w", err)
+	}
+
+	var ids []spotify.ID
+	for _, t := range res.Tracks.Tracks {
+		ids = append(ids, t.ID)
+	}
+
+	var tracks []models.Track
+	for i := 0; i < len(ids); i += 50 {
+		end := i + 50
+		if end > len(ids) {
+			end = len(ids)
+		}
+
+		fullTracks, err := p.client.GetTracks(ctx, ids[i:end])
+		if err != nil {
+			return nil, "", fmt.Errorf("get full tracks for album: %w", err)
+		}
+
+		for _, ft := range fullTracks {
+			tracks = append(tracks, p.transform(*ft))
+		}
+	}
+
+	return tracks, res.Name, nil
+}
+
+func (p *SpotifyParser) handleTrack(ctx context.Context, id spotify.ID) ([]models.Track, string, error) {
+	res, err := p.client.GetTrack(ctx, id)
+	if err != nil {
+		return nil, "", fmt.Errorf("get track: %w", err)
+	}
+	return []models.Track{p.transform(*res)}, res.Name, nil
+}
+
+func (p *SpotifyParser) parseURL(urlStr string) (spotify.ID, string, error) {
+	if strings.Contains(urlStr, "/playlist/") {
+		return p.extractID(urlStr), "playlist", nil
+	} else if strings.Contains(urlStr, "/album/") {
+		return p.extractID(urlStr), "album", nil
+	} else if strings.Contains(urlStr, "/track/") {
+		return p.extractID(urlStr), "track", nil
+	}
+	return "", "", fmt.Errorf("could not identify media type from URL")
+}
+
+func (p *SpotifyParser) extractID(urlStr string) spotify.ID {
+	parts := strings.Split(urlStr, "/")
+	lastPart := parts[len(parts)-1]
+	id := strings.Split(lastPart, "?")[0]
+	return spotify.ID(id)
+}
+
+func (p *SpotifyParser) transform(st spotify.FullTrack) models.Track {
+	artists := make([]string, len(st.Artists))
+	for i, a := range st.Artists {
+		artists[i] = a.Name
+	}
 
 	return models.Track{
 		Title:    st.Name,
 		Artist:   strings.Join(artists, ", "),
 		Album:    st.Album.Name,
-		ISRC:     isrc,
+		ISRC:     st.ExternalIDs["isrc"],
 		Type:     "spotify",
 		SourceID: string(st.ID),
 	}
