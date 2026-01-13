@@ -13,26 +13,44 @@ import (
 )
 
 // canonical header mapping
-var headerAliases = map[string]string{
-	"title":             "title",
-	"track":             "title",
-	"track_title":       "title",
-	"name":              "title",
-	"artist":            "artist",
-	"artist_name":       "artist",
-	"performer":         "artist",
-	"album":             "album",
-	"album_title":       "album",
-	"isrc":              "isrc",
-	"spotify":           "spotify",
-	"spotify_uri":       "spotify",
-	"spotify_track_uri": "spotify",
-	"uri":               "spotify",
+var headerAliases = map[string][]string{
+	"title": {
+		"title", "track", "track name", "track_title", "name",
+	},
+	"artist": {
+		"artist", "artists", "artist name", "artist_name", "performer",
+	},
+	"album": {
+		"album", "album name", "album_title",
+	},
+	"isrc": {
+		"isrc", "isrc code",
+	},
+	"spotify": {
+		"spotify", "spotify uri", "spotify track uri", "uri",
+	},
 }
 
 func normalize(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
+
+func buildHeaderLookup() map[string]string {  
+	lookup := make(map[string]string)  
+  
+	for canonical, aliases := range headerAliases {  
+		for _, a := range aliases {  
+			n := normalize(a)  
+			if prev, exists := lookup[n]; exists && prev != canonical {  
+				panic("header alias conflict: " + a)  
+			}  
+			lookup[n] = canonical  
+		}  
+	}  
+	return lookup  
+}  
+  
+var headerLookup = buildHeaderLookup()  
 
 // ParseCSV now takes DB, Client, and Match Mode to process tracks through the matcher
 type ProgressCallback func(index, total int, res *models.MatchResult)
@@ -59,7 +77,7 @@ func ParseCSV(r *http.Request, db *sql.DB, client *dab.Client, mode string, onPr
 	columnMap := make(map[int]string)
 
 	for i, h := range rawHeaders {
-		if canonical, ok := headerAliases[normalize(h)]; ok {
+		if canonical, ok := headerLookup[normalize(h)]; ok {
 			columnMap[i] = canonical
 		}
 	}
