@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+    "log"
 
 	"dbh-go-srv/internal/dab"
 	"dbh-go-srv/internal/database"
@@ -13,7 +14,7 @@ import (
 	"github.com/adrg/strutil/metrics"
 )
 
-func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *models.MatchResult {
+func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string, debugMode bool) *models.MatchResult {
 	// 1. Check SQLite Registry first
 	if db != nil {
 		cachedID, err := database.GetDabIDFromSource(db, t.Type, t.SourceID)
@@ -42,12 +43,36 @@ func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *mo
 	}
 
 	// 3. Search (Qobuz w/ DAB Fallback)
-	query := t.Artist + " " + t.Title
-	if t.ISRC != "" {
-		query = t.ISRC // ISRC provides 100% precision on Qobuz/DAB
+	useISRC := isValidISRC(t.ISRC)
+
+	query := strings.TrimSpace(t.Artist + " " + t.Title)
+	queryType := "text"
+
+	if useISRC {
+		query = t.ISRC
+		queryType = "isrc"
 	}
-	
+
+	if debugMode {
+		log.Printf(
+			"[MATCH] source=%s sourceID=%s title=%q artist=%q isrc=%q validISRC=%v queryType=%s query=%q",
+			t.Type,
+			t.SourceID,
+			t.Title,
+			t.Artist,
+			t.ISRC,
+			useISRC,
+			queryType,
+			query,
+	)
+	}
+
 	results := client.Search(query)
+
+	if debugMode {
+		log.Printf("[MATCH] search results=%d for queryType=%s query=%q", len(results), queryType, query)
+	}
+
 	if len(results) == 0 {
 		return &models.MatchResult{Track: t, MatchStatus: "NOT_FOUND"}
 	}
@@ -66,9 +91,9 @@ func MatchTrack(db *sql.DB, client *dab.Client, t models.Track, mode string) *mo
 		if mode == "strict" { threshold = 0.95 }
 
 		// If we have an ISRC match, we treat it as a perfect 1.0
-		if t.ISRC != "" && query == t.ISRC {
-			score = 1.0
-		}
+		if useISRC {
+        	score = 1.0
+        }
 
 		if score >= threshold && score > highestScore {
 			highestScore = score
@@ -104,6 +129,22 @@ func iif(condition bool, a, b string) string {
 	return b
 }
 
+func isValidISRC(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case i < 2 && (r < 'A' || r > 'Z'):
+			return false
+		case i >= 2 && i < 5 && (r < 'A' || r > 'Z'):
+			return false
+		case i >= 5 && (r < '0' || r > '9'):
+			return false
+		}
+	}
+	return true
+}
 
 func findBestQuality(tracks []dab.DabTrack) dab.DabTrack {
 	best := tracks[0]

@@ -187,6 +187,7 @@ func handleConvert(db *sql.DB, sp *parser.SpotifyParser, debugMode bool, w http.
 			db,
 			client,
 			matchMode,
+            debugMode,
 			onProgress,
 		)
 		if err != nil {
@@ -291,7 +292,7 @@ func handleConvert(db *sql.DB, sp *parser.SpotifyParser, debugMode bool, w http.
 		default:
 		}
 
-		res := matcher.MatchTrack(db, client, t, matchMode)
+		res := matcher.MatchTrack(db, client, t, matchMode, debugMode)
 		results = append(results, *res)
 
 		send(map[string]any{
@@ -366,7 +367,7 @@ func main() {
 	spotifyClient := spotify.New(httpClient)
 
 	// 4. Initialize Parsers
-    spotifyParser := parser.NewSpotifyParser(spotifyClient)
+    spotifyParser := parser.NewSpotifyParser(spotifyClient, debugMode)
 
     // 5. Routing
     http.HandleFunc("/api/v1/convert", RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {

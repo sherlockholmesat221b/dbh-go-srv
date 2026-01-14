@@ -54,7 +54,7 @@ var headerLookup = buildHeaderLookup()
 
 // ParseCSV now takes DB, Client, and Match Mode to process tracks through the matcher
 type ProgressCallback func(index, total int, res *models.MatchResult)
-func ParseCSV(r *http.Request, db *sql.DB, client *dab.Client, mode string, onProgress ProgressCallback) ([]models.MatchResult, string, error) {
+func ParseCSV(r *http.Request, db *sql.DB, client *dab.Client, mode string, debug bool, onProgress ProgressCallback) ([]models.MatchResult, string, error) {
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		return nil, "", err
@@ -115,7 +115,7 @@ func ParseCSV(r *http.Request, db *sql.DB, client *dab.Client, mode string, onPr
 		}
 
 		// Match and trigger SSE callback
-		res := matcher.MatchTrack(db, client, t, mode)
+		res := matcher.MatchTrack(db, client, t, mode, debug)
 		results = append(results, *res)
 
 		if onProgress != nil {

@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"dbh-go-srv/internal/models"
@@ -11,26 +12,63 @@ import (
 )
 
 type SpotifyParser struct {
-	client *spotify.Client
+	client    *spotify.Client
+	debugMode bool
 }
 
-func NewSpotifyParser(client *spotify.Client) *SpotifyParser {
-	return &SpotifyParser{client: client}
+func NewSpotifyParser(client *spotify.Client, debugMode bool) *SpotifyParser {
+	return &SpotifyParser{
+		client:    client,
+		debugMode: debugMode,
+	}
 }
 
 // Parse tries SpotiFLAC first, then falls back to official Spotify API
 func (p *SpotifyParser) Parse(ctx context.Context, url string) ([]models.Track, string, error) {
+	if p.debugMode {
+		log.Printf("[SPOTIFY] Parse start url=%q", url)
+	}
+
 	// --- Step 1: Try SpotiFLAC metadata fetch ---
 	meta, err := spotifetch.GetFilteredSpotifyData(ctx, url, false, 0)
 	if err == nil {
 		tracks, name := convertMetadataToTracks(meta)
+
+		if p.debugMode {
+			log.Printf(
+				"[SPOTIFY] spotifetch SUCCESS name=%q tracks=%d metaType=%T",
+				name,
+				len(tracks),
+				meta,
+			)
+			for i, t := range tracks {
+				log.Printf(
+					"[SPOTIFY] spotifetch track[%d] title=%q artist=%q album=%q isrc=%q sourceID=%q",
+					i,
+					t.Title,
+					t.Artist,
+					t.Album,
+					t.ISRC,
+					t.SourceID,
+				)
+			}
+		}
+
 		return tracks, name, nil
+	}
+
+	if p.debugMode {
+		log.Printf("[SPOTIFY] spotifetch FAILED: %v — falling back to Web API", err)
 	}
 
 	// --- Step 2: Fallback to official Spotify Web API ---
 	id, mediaType, err := p.parseURL(url)
 	if err != nil {
 		return nil, "", fmt.Errorf("spotify parse url: %w", err)
+	}
+
+	if p.debugMode {
+		log.Printf("[SPOTIFY] fallback mediaType=%s id=%s", mediaType, id)
 	}
 
 	switch mediaType {
@@ -54,7 +92,7 @@ func convertMetadataToTracks(meta interface{}) ([]models.Track, string) {
 		t := v.Track
 		tracks = append(tracks, models.Track{
 			Title:    t.Name,
-			Artist:   t.Artists, // Already a string in spotifetch
+			Artist:   t.Artists,
 			Album:    t.AlbumName,
 			ISRC:     t.ISRC,
 			SourceID: t.SpotifyID,
@@ -86,13 +124,14 @@ func convertMetadataToTracks(meta interface{}) ([]models.Track, string) {
 				Type:     "spotify",
 			})
 		}
-		return tracks, v.PlaylistInfo.Owner.Name // Or v.PlaylistInfo.Description
+		return tracks, v.PlaylistInfo.Owner.Name
 	}
 
 	return nil, ""
 }
 
-// --- Original Web API functions ---
+// --- Web API functions ---
+
 func (p *SpotifyParser) handlePlaylist(ctx context.Context, id spotify.ID) ([]models.Track, string, error) {
 	res, err := p.client.GetPlaylist(ctx, id)
 	if err != nil {
@@ -101,10 +140,23 @@ func (p *SpotifyParser) handlePlaylist(ctx context.Context, id spotify.ID) ([]mo
 
 	var tracks []models.Track
 	trackPage := res.Tracks
+
 	for {
 		for _, item := range trackPage.Tracks {
 			if item.Track.ID != "" && !item.IsLocal {
-				tracks = append(tracks, p.transform(item.Track))
+				t := p.transform(item.Track)
+				tracks = append(tracks, t)
+
+				if p.debugMode {
+					log.Printf(
+						"[SPOTIFY] playlist track title=%q artist=%q album=%q isrc=%q sourceID=%q",
+						t.Title,
+						t.Artist,
+						t.Album,
+						t.ISRC,
+						t.SourceID,
+					)
+				}
 			}
 		}
 
@@ -144,7 +196,19 @@ func (p *SpotifyParser) handleAlbum(ctx context.Context, id spotify.ID) ([]model
 		}
 
 		for _, ft := range fullTracks {
-			tracks = append(tracks, p.transform(*ft))
+			t := p.transform(*ft)
+			tracks = append(tracks, t)
+
+			if p.debugMode {
+				log.Printf(
+					"[SPOTIFY] album track title=%q artist=%q album=%q isrc=%q sourceID=%q",
+					t.Title,
+					t.Artist,
+					t.Album,
+					t.ISRC,
+					t.SourceID,
+				)
+			}
 		}
 	}
 
@@ -156,15 +220,30 @@ func (p *SpotifyParser) handleTrack(ctx context.Context, id spotify.ID) ([]model
 	if err != nil {
 		return nil, "", fmt.Errorf("get track: %w", err)
 	}
-	return []models.Track{p.transform(*res)}, res.Name, nil
+
+	t := p.transform(*res)
+
+	if p.debugMode {
+		log.Printf(
+			"[SPOTIFY] single track title=%q artist=%q album=%q isrc=%q sourceID=%q",
+			t.Title,
+			t.Artist,
+			t.Album,
+			t.ISRC,
+			t.SourceID,
+		)
+	}
+
+	return []models.Track{t}, res.Name, nil
 }
 
 func (p *SpotifyParser) parseURL(urlStr string) (spotify.ID, string, error) {
-	if strings.Contains(urlStr, "/playlist/") {
+	switch {
+	case strings.Contains(urlStr, "/playlist/"):
 		return p.extractID(urlStr), "playlist", nil
-	} else if strings.Contains(urlStr, "/album/") {
+	case strings.Contains(urlStr, "/album/"):
 		return p.extractID(urlStr), "album", nil
-	} else if strings.Contains(urlStr, "/track/") {
+	case strings.Contains(urlStr, "/track/"):
 		return p.extractID(urlStr), "track", nil
 	}
 	return "", "", fmt.Errorf("could not identify media type from URL")
