@@ -85,7 +85,7 @@ func sendEvent(w http.ResponseWriter, flusher http.Flusher, payload any) {
    Handler
    ========================= */
 
-func handleConvert(db *sql.DB, sp *parser.SpotifyParser, w http.ResponseWriter, r *http.Request) {
+func handleConvert(db *sql.DB, sp *parser.SpotifyParser, debugMode bool, w http.ResponseWriter, r *http.Request) {
 	/* =========================
 	   CORS Preflight
 	   ========================= */
@@ -114,7 +114,7 @@ func handleConvert(db *sql.DB, sp *parser.SpotifyParser, w http.ResponseWriter, 
 		return
 	}
 
-	client := dab.GetClient(token)
+	client := dab.GetClient(token, debugMode)
 
 	userID, err := client.ValidateToken()
 	if err != nil {
@@ -328,6 +328,19 @@ func main() {
 	if spotifyID == "" || spotifySecret == "" {
 		log.Fatal("CRITICAL: SPOTIFY_ID and SPOTIFY_SECRET must be set in environment")
 	}
+    if os.Getenv("QOBUZ_APP_ID") == "" {
+		log.Fatal("CRITICAL: QOBUZ_APP_ID must be set")
+	}
+	if os.Getenv("QOBUZ_USER_AUTH_TOKEN") == "" {
+		log.Fatal("CRITICAL: QOBUZ_USER_AUTH_TOKEN must be set")
+	}
+    
+    debugMode := os.Getenv("DEBUG") == "1"
+
+    if debugMode {
+    	log.Println("========== VERBOSE DEBUG ENABLED ==========")
+    	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+    }
 
 	// 2. Database Setup
 	dbPath := "./data/registry.db"
@@ -362,7 +375,7 @@ func main() {
             return
         }
         // PASS the parser instance here
-        handleConvert(db, spotifyParser, w, r) 
+        handleConvert(db, spotifyParser, debugMode, w, r) 
     }))
 
 
